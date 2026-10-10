@@ -13,11 +13,15 @@ use tracing::{debug, warn};
 use super::QuickSettingsWindowHandle;
 use super::audio_card::volume_icon_name;
 use super::bluetooth_card::bt_icon_name;
-use super::network_card::{NetworkIconContext, mobile_state_icon_name, network_icon_name};
+use super::network_card::{
+    NetworkIconContext, bar_network_icon_name, mobile_state_icon_name, wifi_ghost_overlay,
+    wifi_icon_is_partial,
+};
 use super::vpn_card::vpn_icon_name;
 use crate::services::audio::{AudioService, AudioSnapshot};
 use crate::services::bluetooth::{BluetoothService, BluetoothSnapshot};
 use crate::services::callbacks::CallbackId;
+use crate::services::icons::{IconHandle, IconsService};
 use crate::services::network::{NetworkService, NetworkSnapshot};
 use crate::services::tooltip::TooltipManager;
 use crate::services::vpn::{VpnService, VpnSnapshot};
@@ -222,6 +226,18 @@ impl QuickSettingsConfig {
     const DEFAULT_AUDIO_SCROLL_PERCENTAGE: i32 = 5;
 }
 
+/// Whether the bar's dimmed full-signal Wi-Fi ghost should be shown.
+fn wifi_ghost_visible(uses_material: bool, icon_name: &str, connecting: bool) -> bool {
+    uses_material && !connecting && wifi_icon_is_partial(icon_name)
+}
+
+fn update_wifi_ghost(ghost: &IconHandle, icon_name: &str, connecting: bool) {
+    let uses_material = IconsService::global().uses_material();
+    ghost
+        .widget()
+        .set_visible(wifi_ghost_visible(uses_material, icon_name, connecting));
+}
+
 /// Bar-side Quick Settings indicator.
 pub struct QuickSettingsWidget {
     base: BaseWidget,
@@ -381,7 +397,17 @@ impl QuickSettingsWidget {
             let wired_connected = snapshot.wired_connected();
 
             let ctx = NetworkIconContext::for_bar(&snapshot);
-            let wifi_icon = base.add_icon(network_icon_name(&ctx), &[icon::ICON, icon::TEXT]);
+            let initial_icon = bar_network_icon_name(&ctx, snapshot.active_strength());
+            let icons = IconsService::global();
+            let wifi_icon = icons.create_icon(initial_icon, &[icon::ICON, icon::TEXT]);
+
+            // Partial Wi-Fi signal sits on a dimmed full-signal ghost (Material
+            // only), matching the QS network list.
+            let (wifi_overlay, wifi_ghost) =
+                wifi_ghost_overlay(&icons, &wifi_icon, &[icon::ICON, icon::TEXT]);
+            wifi_overlay.set_halign(gtk4::Align::Center);
+            wifi_overlay.set_hexpand(true);
+            base.content().append(&wifi_overlay);
 
             if !wifi_enabled && !wired_connected {
                 wifi_icon.widget().add_css_class(qs::WIFI_DISABLED_ICON);
@@ -390,6 +416,7 @@ impl QuickSettingsWidget {
             if wifi_connecting {
                 wifi_icon.set_spinning(true);
             }
+            update_wifi_ghost(&wifi_ghost, initial_icon, wifi_connecting);
 
             if (wifi_enabled && snapshot.connected()) || wired_connected || wifi_connecting {
                 wifi_icon.widget().add_css_class(state::ICON_ACTIVE);
@@ -406,6 +433,7 @@ impl QuickSettingsWidget {
                         widget.remove_css_class(state::ICON_ACTIVE);
                         wifi_icon_handle.set_spinning(false);
                         wifi_icon_handle.set_icon("network-wireless-offline-symbolic");
+                        wifi_ghost.widget().set_visible(false);
                         TooltipManager::global()
                             .set_styled_tooltip(&widget, "Wi-Fi: Service unavailable");
                         return;
@@ -417,10 +445,12 @@ impl QuickSettingsWidget {
                     let wired_connected = snapshot.wired_connected();
 
                     let ctx = NetworkIconContext::for_bar(snapshot);
-                    wifi_icon_handle.set_icon(network_icon_name(&ctx));
+                    let icon_name = bar_network_icon_name(&ctx, snapshot.active_strength());
+                    wifi_icon_handle.set_icon(icon_name);
 
                     let wifi_connecting = snapshot.wifi_connecting();
                     wifi_icon_handle.set_spinning(wifi_connecting);
+                    update_wifi_ghost(&wifi_ghost, icon_name, wifi_connecting);
 
                     if !enabled && !wired_connected {
                         widget.add_css_class(qs::WIFI_DISABLED_ICON);
@@ -760,5 +790,22 @@ mod tests {
 
         let config = QuickSettingsConfig::from_entry(&entry);
         assert!(config.remember_expanded_state);
+    }
+
+    #[test]
+    fn wifi_ghost_only_for_partial_material_signal() {
+        let weak = "network-wireless-signal-weak-symbolic";
+        let full = "network-wireless-signal-excellent-symbolic";
+        assert!(wifi_ghost_visible(true, weak, false));
+        // Full signal, GTK themes and the connecting spinner never show a ghost.
+        assert!(!wifi_ghost_visible(true, full, false));
+        assert!(!wifi_ghost_visible(false, weak, false));
+        assert!(!wifi_ghost_visible(true, weak, true));
+        assert!(!wifi_ghost_visible(
+            true,
+            "network-wireless-offline-symbolic",
+            false
+        ));
+        assert!(!wifi_ghost_visible(true, "network-wired-symbolic", false));
     }
 }

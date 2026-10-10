@@ -30,7 +30,7 @@ use super::window::current_quick_settings_window;
 use crate::services::icons::{IconHandle, IconsService};
 use crate::services::network::{
     AUTH_FAILURE_REASON, CONNECTION_FAILURE_REASON, NetworkConnectionState, NetworkService,
-    NetworkSnapshot, WifiNetwork,
+    NetworkSnapshot, WifiNetwork, wifi_signal_band,
 };
 use crate::services::surfaces::SurfaceStyleManager;
 use crate::styles::{button, color, icon, qs, row, state, surface};
@@ -111,17 +111,64 @@ pub fn network_icon_name(ctx: &NetworkIconContext) -> &'static str {
 
 /// Return a Wi-Fi icon name based on signal strength percentage.
 pub fn wifi_strength_icon(level: i32) -> &'static str {
-    if level >= 70 {
-        "network-wireless-signal-excellent-symbolic"
-    } else if level >= 60 {
-        "network-wireless-signal-good-symbolic"
-    } else if level >= 40 {
-        "network-wireless-signal-ok-symbolic"
-    } else if level >= 20 {
-        "network-wireless-signal-weak-symbolic"
-    } else {
-        "network-wireless-signal-none-symbolic"
+    match wifi_signal_band(level) {
+        4 => "network-wireless-signal-excellent-symbolic",
+        3 => "network-wireless-signal-good-symbolic",
+        2 => "network-wireless-signal-ok-symbolic",
+        1 => "network-wireless-signal-weak-symbolic",
+        _ => "network-wireless-signal-none-symbolic",
     }
+}
+
+/// Bar Wi-Fi/Ethernet icon: like [`network_icon_name`], but a connected Wi-Fi
+/// link reflects signal strength. Strength 0 means "not yet known" and keeps
+/// the full-signal icon so a fresh connection doesn't flash "no signal".
+pub fn bar_network_icon_name(ctx: &NetworkIconContext, wifi_strength: i32) -> &'static str {
+    let on_wifi = ctx.available
+        && !ctx.wired_connected
+        && !ctx.mobile_is_primary
+        && ctx.has_wifi_device
+        && ctx.wifi_enabled
+        && ctx.connected;
+    if on_wifi && wifi_strength > 0 {
+        wifi_strength_icon(wifi_strength)
+    } else {
+        network_icon_name(ctx)
+    }
+}
+
+/// Whether a Wi-Fi icon shows partial signal. With Material icons these are
+/// drawn on top of a dimmed full-signal "ghost" so weak signal isn't a lone dot
+/// (GTK themes such as Adwaita/Breeze bake the dimmed arcs into the SVG).
+pub fn wifi_icon_is_partial(icon_name: &str) -> bool {
+    matches!(
+        icon_name,
+        "network-wireless-signal-none-symbolic"
+            | "network-wireless-signal-weak-symbolic"
+            | "network-wireless-signal-ok-symbolic"
+            | "network-wireless-signal-good-symbolic"
+    )
+}
+
+/// Stack `level` on top of a dimmed full-signal Wi-Fi ghost icon.
+///
+/// `ghost_classes` are applied to the ghost in addition to the dimmed styling.
+/// `level` is measured too, so the overlay keeps its size if the ghost is hidden.
+pub fn wifi_ghost_overlay(
+    icons: &IconsService,
+    level: &IconHandle,
+    ghost_classes: &[&str],
+) -> (Overlay, IconHandle) {
+    let mut classes = ghost_classes.to_vec();
+    classes.extend([qs::WIFI_BASE, color::DISABLED]);
+    let ghost = icons.create_icon("network-wireless-signal-excellent-symbolic", &classes);
+    level.widget().add_css_class(qs::WIFI_OVERLAY);
+
+    let overlay = Overlay::new();
+    overlay.set_child(Some(&ghost.widget()));
+    overlay.add_overlay(&level.widget());
+    overlay.set_measure_overlay(&level.widget(), true);
+    (overlay, ghost)
 }
 
 /// Map cellular signal quality (0–100%) to a symbolic icon name.
@@ -1105,13 +1152,7 @@ pub fn populate_wifi_list(
         let strength_icon_name = wifi_strength_icon(net.strength);
 
         // Check if this is a partial signal that needs the overlay treatment
-        let needs_overlay = matches!(
-            strength_icon_name,
-            "network-wireless-signal-none-symbolic"
-                | "network-wireless-signal-weak-symbolic"
-                | "network-wireless-signal-ok-symbolic"
-                | "network-wireless-signal-good-symbolic"
-        );
+        let needs_overlay = wifi_icon_is_partial(strength_icon_name);
 
         let icon_color = if net.active || is_connecting {
             color::ACCENT
@@ -1129,22 +1170,11 @@ pub fn populate_wifi_list(
             *state.wifi_connecting_icon.borrow_mut() = Some(icon_handle.clone());
             icon_handle.widget()
         } else if icons.uses_material() && needs_overlay {
-            // Create base icon (full signal, dimmed)
-            let base_handle = icons.create_icon(
-                "network-wireless-signal-excellent-symbolic",
-                &[icon::TEXT, row::QS_ICON, qs::WIFI_BASE, color::DISABLED],
-            );
-
-            // Create overlay icon (actual signal level, highlighted)
-            let overlay_handle = icons.create_icon(
-                strength_icon_name,
-                &[icon::TEXT, row::QS_ICON, qs::WIFI_OVERLAY, icon_color],
-            );
-
-            // Stack them using Overlay
-            let overlay = Overlay::new();
-            overlay.set_child(Some(&base_handle.widget()));
-            overlay.add_overlay(&overlay_handle.widget());
+            // Actual signal level on top of a dimmed full-signal ghost.
+            let level_handle =
+                icons.create_icon(strength_icon_name, &[icon::TEXT, row::QS_ICON, icon_color]);
+            let (overlay, _ghost) =
+                wifi_ghost_overlay(&icons, &level_handle, &[icon::TEXT, row::QS_ICON]);
             overlay.upcast()
         } else {
             // Simple single icon for full signal or non-Material themes
@@ -2033,6 +2063,110 @@ mod tests {
             }),
             "network-wireless-signal-excellent-symbolic"
         );
+    }
+
+    #[test]
+    fn test_bar_network_icon_name_tracks_wifi_strength() {
+        let connected = NetworkIconContext {
+            connected: true,
+            ..test_icon_ctx()
+        };
+        assert_eq!(
+            bar_network_icon_name(&connected, 85),
+            "network-wireless-signal-excellent-symbolic"
+        );
+        assert_eq!(
+            bar_network_icon_name(&connected, 65),
+            "network-wireless-signal-good-symbolic"
+        );
+        assert_eq!(
+            bar_network_icon_name(&connected, 45),
+            "network-wireless-signal-ok-symbolic"
+        );
+        assert_eq!(
+            bar_network_icon_name(&connected, 25),
+            "network-wireless-signal-weak-symbolic"
+        );
+        assert_eq!(
+            bar_network_icon_name(&connected, 5),
+            "network-wireless-signal-none-symbolic"
+        );
+    }
+
+    #[test]
+    fn test_bar_network_icon_name_unknown_strength_shows_full() {
+        let connected = NetworkIconContext {
+            connected: true,
+            ..test_icon_ctx()
+        };
+        assert_eq!(
+            bar_network_icon_name(&connected, 0),
+            "network-wireless-signal-excellent-symbolic"
+        );
+    }
+
+    #[test]
+    fn test_bar_network_icon_name_ignores_strength_when_not_on_wifi() {
+        // Disconnected: stale strength must not produce a signal icon.
+        assert_eq!(
+            bar_network_icon_name(&test_icon_ctx(), 30),
+            "network-wireless-offline-symbolic"
+        );
+        // Wired takes precedence over Wi-Fi strength.
+        assert_eq!(
+            bar_network_icon_name(
+                &NetworkIconContext {
+                    connected: true,
+                    wired_connected: true,
+                    ..test_icon_ctx()
+                },
+                30
+            ),
+            "network-wired-symbolic"
+        );
+        // Service unavailable.
+        assert_eq!(
+            bar_network_icon_name(
+                &NetworkIconContext {
+                    available: false,
+                    connected: true,
+                    ..test_icon_ctx()
+                },
+                30
+            ),
+            "network-wireless-offline-symbolic"
+        );
+        // Wi-Fi radio off.
+        assert_eq!(
+            bar_network_icon_name(
+                &NetworkIconContext {
+                    wifi_enabled: false,
+                    connected: true,
+                    ..test_icon_ctx()
+                },
+                30
+            ),
+            "network-wireless-offline-symbolic"
+        );
+    }
+
+    #[test]
+    fn test_wifi_icon_is_partial() {
+        assert!(!wifi_icon_is_partial(
+            "network-wireless-signal-excellent-symbolic"
+        ));
+        assert!(wifi_icon_is_partial(
+            "network-wireless-signal-good-symbolic"
+        ));
+        assert!(wifi_icon_is_partial("network-wireless-signal-ok-symbolic"));
+        assert!(wifi_icon_is_partial(
+            "network-wireless-signal-weak-symbolic"
+        ));
+        assert!(wifi_icon_is_partial(
+            "network-wireless-signal-none-symbolic"
+        ));
+        assert!(!wifi_icon_is_partial("network-wireless-offline-symbolic"));
+        assert!(!wifi_icon_is_partial("network-wired-symbolic"));
     }
 
     #[test]

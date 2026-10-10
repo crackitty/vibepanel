@@ -667,6 +667,32 @@ fn detect_backend() -> NetworkBackend {
     NetworkBackend::NetworkManager(NmService::global())
 }
 
+/// Wi-Fi signal band (0 = none … 4 = excellent) used for icon selection.
+pub fn wifi_signal_band(strength: i32) -> u8 {
+    match strength {
+        70.. => 4,
+        60.. => 3,
+        40.. => 2,
+        20.. => 1,
+        _ => 0,
+    }
+}
+
+/// Minimum change in signal percentage worth notifying for within a band.
+const WIFI_STRENGTH_NOTIFY_DELTA: i32 = 5;
+
+/// Whether a live strength update should be published. Small fluctuations
+/// within the same band are ignored to avoid redraw churn.
+pub(crate) fn wifi_strength_change_significant(old: i32, new: i32) -> bool {
+    if old == new {
+        return false;
+    }
+    old == 0
+        || new == 0
+        || wifi_signal_band(old) != wifi_signal_band(new)
+        || (new - old).abs() >= WIFI_STRENGTH_NOTIFY_DELTA
+}
+
 /// Extract a D-Bus object path (`type o`) from a [`glib::Variant`] as a `String`.
 pub(super) fn objpath_to_string(v: &glib::Variant) -> Option<String> {
     v.get::<glib::variant::ObjectPath>()
@@ -695,5 +721,35 @@ mod tests {
         assert_eq!(credentials.authentication, WifiAuthentication::Open);
         assert!(active_open_wifi_credentials(&[network(SecurityType::Secured)]).is_err());
         assert!(active_open_wifi_credentials(&[]).is_err());
+    }
+
+    #[test]
+    fn wifi_signal_band_thresholds() {
+        assert_eq!(wifi_signal_band(100), 4);
+        assert_eq!(wifi_signal_band(70), 4);
+        assert_eq!(wifi_signal_band(69), 3);
+        assert_eq!(wifi_signal_band(60), 3);
+        assert_eq!(wifi_signal_band(59), 2);
+        assert_eq!(wifi_signal_band(40), 2);
+        assert_eq!(wifi_signal_band(39), 1);
+        assert_eq!(wifi_signal_band(20), 1);
+        assert_eq!(wifi_signal_band(19), 0);
+        assert_eq!(wifi_signal_band(0), 0);
+    }
+
+    #[test]
+    fn wifi_strength_change_significance() {
+        // Unchanged or small drift within a band is ignored.
+        assert!(!wifi_strength_change_significant(50, 50));
+        assert!(!wifi_strength_change_significant(50, 53));
+        assert!(!wifi_strength_change_significant(53, 50));
+        // Large drift within a band is published (tooltip percentage).
+        assert!(wifi_strength_change_significant(80, 90));
+        // Crossing a band boundary is published even for tiny changes.
+        assert!(wifi_strength_change_significant(69, 70));
+        assert!(wifi_strength_change_significant(40, 39));
+        // Transitions to/from unknown are always published.
+        assert!(wifi_strength_change_significant(0, 2));
+        assert!(wifi_strength_change_significant(72, 0));
     }
 }
