@@ -166,7 +166,7 @@ impl CompositorManager {
         // Immediately replay the latest update for every output, like the
         // other register_* methods. WindowTitleService registers before it has
         // subscribers and replays to them itself via `window_updates()`.
-        for info in window_updates_for_replay(&self.last_window_infos.borrow()) {
+        for info in self.window_updates() {
             self.window_callbacks.notify_single(id, &info);
         }
 

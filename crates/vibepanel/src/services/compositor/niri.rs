@@ -551,7 +551,6 @@ impl NiriBackend {
         Self::update_window_counts(shared);
 
         // If the window is focused, update focused window.
-        // Focus updates are used by WindowTitleService to display the active window title.
         if is_focused {
             return Self::update_focused_window_from_cache(shared);
         }
