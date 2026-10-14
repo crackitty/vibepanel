@@ -139,7 +139,8 @@ pub struct WindowLayoutSnapshot {
 pub type WorkspaceCallback = Arc<dyn Fn(WorkspaceSnapshot) + Send + Sync>;
 
 /// Callback type for focused window updates.
-/// Receives `WindowInfo::default()` when no window is focused.
+/// Receives an empty `WindowInfo` when no window is focused; backends may set
+/// its `output` to the focused monitor so only that bar clears.
 pub type WindowCallback = Arc<dyn Fn(WindowInfo) + Send + Sync>;
 
 /// Callback type for keyboard layout updates.
@@ -243,6 +244,13 @@ pub trait CompositorBackend: Send + Sync {
     /// Returns the last known focused window info, or None if
     /// no window is focused or state is unknown.
     fn get_focused_window(&self) -> Option<WindowInfo>;
+
+    /// Get the connector name of the focused output (e.g., "DP-1").
+    ///
+    /// Default: `None` for backends that don't track output focus directly.
+    fn get_focused_output(&self) -> Option<String> {
+        None
+    }
 
     /// Switch to a workspace.
     ///

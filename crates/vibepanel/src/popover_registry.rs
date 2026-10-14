@@ -124,9 +124,10 @@ pub fn test_layer_shell_window(name: &str) -> Option<gtk4::ApplicationWindow> {
 
 /// Resolve which handle to dispatch to based on the focused monitor.
 ///
-/// Tries the focused window's output first. Falls back to the active
-/// workspace's output (survives layer-shell keyboard grabs where the
-/// compositor unfocuses all windows). Last resort: first registered handle.
+/// Tries the backend's focused output, then the focused window's output.
+/// Falls back to the active workspace's output, where the backend reports
+/// workspace outputs (covers empty workspaces with no focused window).
+/// Last resort: first registered handle.
 fn resolve_focused_handle(
     handles: &[Rc<dyn PopoverToggleable>],
 ) -> Option<Rc<dyn PopoverToggleable>> {
@@ -136,10 +137,10 @@ fn resolve_focused_handle(
     let manager = crate::services::compositor::CompositorManager::global();
 
     let focused_output = manager
-        .get_focused_window()
-        .and_then(|w| w.output)
+        .get_focused_output()
+        .or_else(|| manager.get_focused_window().and_then(|w| w.output))
         .or_else(|| {
-            // No focused window (e.g. popover has exclusive keyboard grab).
+            // No focused window (e.g. empty workspace).
             // Derive from the globally-active workspace's output instead.
             let snapshot = manager.get_workspace_snapshot();
             manager.list_workspaces().into_iter().find_map(|ws| {
