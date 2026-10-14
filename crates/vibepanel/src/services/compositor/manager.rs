@@ -24,6 +24,7 @@
 //! ```
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -53,7 +54,8 @@ pub struct CompositorManager {
     window_layout_callbacks: Callbacks<WindowLayoutSnapshot>,
     window_list_callbacks: Callbacks<super::WindowListSnapshot>,
     last_workspace_snapshot: RefCell<Option<WorkspaceSnapshot>>,
-    last_window_info: RefCell<Option<WindowInfo>>,
+    /// Latest window update per output (`None` key for unscoped updates).
+    last_window_infos: RefCell<HashMap<Option<String>, WindowInfo>>,
     last_keyboard_layout: RefCell<Option<KeyboardLayoutInfo>>,
     last_window_layouts: RefCell<Option<WindowLayoutSnapshot>>,
     last_window_list: RefCell<Option<super::WindowListSnapshot>>,
@@ -73,7 +75,7 @@ impl CompositorManager {
             window_layout_callbacks: Callbacks::new(),
             window_list_callbacks: Callbacks::new(),
             last_workspace_snapshot: RefCell::new(None),
-            last_window_info: RefCell::new(None),
+            last_window_infos: RefCell::new(HashMap::new()),
             last_keyboard_layout: RefCell::new(None),
             last_window_layouts: RefCell::new(None),
             last_window_list: RefCell::new(None),
@@ -124,7 +126,7 @@ impl CompositorManager {
                 window_layout_callbacks: Callbacks::new(),
                 window_list_callbacks: Callbacks::new(),
                 last_workspace_snapshot: RefCell::new(Some(snapshot)),
-                last_window_info: RefCell::new(None),
+                last_window_infos: RefCell::new(HashMap::new()),
                 last_keyboard_layout: RefCell::new(None),
                 last_window_layouts: RefCell::new(None),
                 last_window_list: RefCell::new(None),
@@ -161,12 +163,19 @@ impl CompositorManager {
     {
         let id = self.window_callbacks.register(callback);
 
-        // Immediately send current state if available
-        if let Some(ref info) = *self.last_window_info.borrow() {
-            self.window_callbacks.notify_single(id, info);
+        // Immediately replay the latest update for every output, like the
+        // other register_* methods. WindowTitleService registers before it has
+        // subscribers and replays to them itself via `window_updates()`.
+        for info in self.window_updates() {
+            self.window_callbacks.notify_single(id, &info);
         }
 
         id
+    }
+
+    /// Latest window update for every output, in replay order.
+    pub(crate) fn window_updates(&self) -> Vec<WindowInfo> {
+        window_updates_for_replay(&self.last_window_infos.borrow())
     }
 
     /// Get the list of workspaces from the backend.
@@ -191,8 +200,8 @@ impl CompositorManager {
 
     /// Get the current focused window info.
     ///
-    /// Delegates to the backend directly — `last_window_info` can be stale
-    /// on backends that emit window callbacks for multiple outputs.
+    /// Delegates to the backend directly, since window callbacks are emitted
+    /// per output rather than only for the focused window.
     pub fn get_focused_window(&self) -> Option<WindowInfo> {
         if let Some(ref backend) = *self.backend.borrow() {
             backend.get_focused_window()
@@ -341,6 +350,10 @@ impl CompositorManager {
         // Store for new listeners
         *self.last_workspace_snapshot.borrow_mut() = Some(snapshot.clone());
 
+        // Drop windows of removed outputs before subscribers can recreate bars,
+        // so a reconnected output doesn't replay a stale title.
+        prune_removed_outputs(&mut self.last_window_infos.borrow_mut(), &snapshot);
+
         // Dispatch to all registered callbacks
         self.workspace_callbacks.notify(&snapshot);
     }
@@ -348,8 +361,15 @@ impl CompositorManager {
     /// Handle a window update from the backend.
     /// Called via glib::idle_add_once from the backend thread.
     pub(crate) fn handle_window_update(&self, window_info: WindowInfo) {
-        // Store for new listeners
-        *self.last_window_info.borrow_mut() = Some(window_info.clone());
+        // Store for new listeners. Window updates aren't coalesced like
+        // workspace snapshots, so one queued before its output was unplugged
+        // can land after the prune. That's accepted on purpose: it can briefly
+        // show a stale title, or on a reconnected output replay its old title
+        // until it's focused or the next workspace update prunes it. Dropping
+        // it would require every backend to publish an output in a snapshot
+        // before any window update for it, and silently lose titles when one
+        // doesn't.
+        store_window_update(&mut self.last_window_infos.borrow_mut(), &window_info);
 
         // Dispatch to all registered callbacks
         self.window_callbacks.notify(&window_info);
@@ -467,7 +487,6 @@ impl CompositorManager {
 
         // Now store initial state - backend has fetched it during start()
         *this.last_workspace_snapshot.borrow_mut() = Some(backend.get_workspace_snapshot());
-        *this.last_window_info.borrow_mut() = backend.get_focused_window();
         *this.last_keyboard_layout.borrow_mut() = backend.get_keyboard_layout();
         *this.last_window_layouts.borrow_mut() = backend.get_window_layouts();
 
@@ -479,11 +498,129 @@ impl CompositorManager {
     }
 }
 
+/// Record a window update for replay to late subscribers. An unscoped update
+/// applies to every output and replaces all entries; otherwise at most one
+/// entry stays marked as focused.
+fn store_window_update(infos: &mut HashMap<Option<String>, WindowInfo>, info: &WindowInfo) {
+    if info.output.is_none() {
+        infos.clear();
+    } else if info.focused {
+        for other in infos.values_mut() {
+            other.focused = false;
+        }
+    }
+    infos.insert(info.output.clone(), info.clone());
+}
+
+/// Remove stored windows for outputs missing from the workspace snapshot.
+/// Unscoped entries are kept. An empty `per_output` means no outputs are
+/// connected, so every per-output entry is removed.
+fn prune_removed_outputs(
+    infos: &mut HashMap<Option<String>, WindowInfo>,
+    snapshot: &WorkspaceSnapshot,
+) {
+    infos.retain(|output, _| {
+        output
+            .as_deref()
+            .is_none_or(|o| snapshot.per_output.contains_key(o))
+    });
+}
+
+/// Stored updates in replay order: the unscoped update first, so later
+/// per-output updates take precedence.
+fn window_updates_for_replay(infos: &HashMap<Option<String>, WindowInfo>) -> Vec<WindowInfo> {
+    let mut updates: Vec<_> = infos.values().cloned().collect();
+    updates.sort_by_key(|info| info.output.is_some());
+    updates
+}
+
 impl Drop for CompositorManager {
     fn drop(&mut self) {
         if let Some(ref backend) = *self.backend.borrow() {
             backend.stop();
         }
         debug!("CompositorManager dropped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(output: &str, focused: bool) -> WindowInfo {
+        WindowInfo {
+            output: Some(output.to_string()),
+            focused,
+            ..Default::default()
+        }
+    }
+
+    fn snapshot_with(outputs: &[&str]) -> WorkspaceSnapshot {
+        let mut snapshot = WorkspaceSnapshot::default();
+        for output in outputs {
+            snapshot
+                .per_output
+                .insert(output.to_string(), Default::default());
+        }
+        snapshot
+    }
+
+    fn titled(output: &str, title: &str) -> WindowInfo {
+        WindowInfo {
+            title: title.to_string(),
+            ..info(output, false)
+        }
+    }
+
+    fn focused_outputs(infos: &HashMap<Option<String>, WindowInfo>) -> Vec<Option<String>> {
+        infos
+            .values()
+            .filter(|i| i.focused)
+            .map(|i| i.output.clone())
+            .collect()
+    }
+
+    #[test]
+    fn cache_keeps_one_focused_output_and_replays_unscoped_first() {
+        let mut infos = HashMap::new();
+        store_window_update(&mut infos, &info("DP-1", true));
+        store_window_update(&mut infos, &info("DP-2", false));
+        store_window_update(&mut infos, &info("DP-3", true));
+        assert_eq!(focused_outputs(&infos), vec![Some("DP-3".to_string())]);
+
+        // An unscoped update applies everywhere and replaces every entry.
+        store_window_update(&mut infos, &WindowInfo::default());
+        assert_eq!(infos.len(), 1);
+
+        store_window_update(&mut infos, &info("DP-2", true));
+        let replay = window_updates_for_replay(&infos);
+        assert_eq!(replay[0].output, None);
+        assert_eq!(replay[1].output.as_deref(), Some("DP-2"));
+    }
+
+    #[test]
+    fn hotplug_prunes_removed_outputs() {
+        let mut infos = HashMap::new();
+        store_window_update(&mut infos, &WindowInfo::default());
+        store_window_update(&mut infos, &info("DP-1", true));
+        store_window_update(&mut infos, &titled("DP-2", "X"));
+
+        // DP-2 is unplugged.
+        prune_removed_outputs(&mut infos, &snapshot_with(&["DP-1"]));
+        assert!(!infos.contains_key(&Some("DP-2".to_string())));
+        assert!(infos.contains_key(&None));
+        assert_eq!(focused_outputs(&infos), vec![Some("DP-1".to_string())]);
+
+        // Every output disconnects (e.g. undocking with the lid closed).
+        prune_removed_outputs(&mut infos, &WorkspaceSnapshot::default());
+        assert_eq!(infos.len(), 1);
+
+        // Reconnecting doesn't replay a title from before the unplug.
+        prune_removed_outputs(&mut infos, &snapshot_with(&["DP-1", "DP-2"]));
+        assert!(
+            window_updates_for_replay(&infos)
+                .iter()
+                .all(|i| i.output.is_none())
+        );
     }
 }

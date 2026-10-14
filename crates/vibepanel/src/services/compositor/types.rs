@@ -91,9 +91,11 @@ pub struct WorkspaceSnapshot {
     pub per_output: HashMap<String, PerOutputState>,
 }
 
-/// Information about a focused window.
+/// Window information for an output.
 ///
-/// Represents the currently focused window's metadata.
+/// Backends emit the focused window, and may also emit updates for other
+/// outputs (Niri emits one per output). `focused` marks the update for the
+/// globally focused output. An empty title and app ID means no window.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WindowInfo {
     /// Window title (may be empty).
@@ -102,6 +104,8 @@ pub struct WindowInfo {
     pub app_id: String,
     /// Output/monitor name the window is on (None if unavailable).
     pub output: Option<String>,
+    /// Whether this update is for the globally focused output.
+    pub focused: bool,
 }
 
 /// Information about the current keyboard layout.

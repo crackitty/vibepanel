@@ -40,6 +40,9 @@ struct SharedState {
     /// Per-output active window info (output name -> WindowInfo).
     /// This tracks the "would be focused" window for each monitor.
     per_output_window: RwLock<HashMap<String, WindowInfo>>,
+    /// Niri's active window per workspace (workspace ID -> window ID). Unlike
+    /// window focus, this is kept while a layer-shell surface has the keyboard.
+    active_windows: RwLock<HashMap<u64, u64>>,
     /// Current keyboard layout info.
     keyboard_layout: RwLock<Option<KeyboardLayoutInfo>>,
     /// List of available keyboard layout names (from Niri's KeyboardLayouts).
@@ -57,6 +60,7 @@ impl Default for SharedState {
             id_to_output: RwLock::new(HashMap::new()),
             windows: RwLock::new(HashMap::new()),
             per_output_window: RwLock::new(HashMap::new()),
+            active_windows: RwLock::new(HashMap::new()),
             keyboard_layout: RwLock::new(None),
             keyboard_layout_names: RwLock::new(Vec::new()),
             keyboard_layout_idx: RwLock::new(0),
@@ -228,9 +232,11 @@ impl NiriBackend {
         let mut ws_list = shared.workspaces.write();
         let mut id_to_output = shared.id_to_output.write();
         let mut snapshot = shared.workspace_snapshot.write();
+        let mut active_windows = shared.active_windows.write();
 
         ws_list.clear();
         id_to_output.clear();
+        active_windows.clear();
         snapshot.occupied_workspaces.clear();
         snapshot.urgent_workspaces.clear();
         snapshot.window_counts.clear();
@@ -259,6 +265,9 @@ impl NiriBackend {
             // Store mapping from Niri workspace ID to output name
             if let Some(ref out) = output {
                 id_to_output.insert(ws_id, out.clone());
+            }
+            if let Some(win_id) = ws.get("active_window_id").and_then(|v| v.as_u64()) {
+                active_windows.insert(ws_id, win_id);
             }
             ws_list.push(WorkspaceMeta {
                 id: stable_id,
@@ -316,12 +325,14 @@ impl NiriBackend {
             (None, None) => a.idx.cmp(&b.idx),
         });
 
-        // Update window counts from window cache
-        // Must drop all write locks before calling update_window_counts
+        // Update window counts and titles from window cache
+        // Must drop all write locks before calling the update helpers
+        drop(active_windows);
         drop(snapshot);
         drop(id_to_output);
         drop(ws_list);
         Self::update_window_counts(shared);
+        Self::update_per_output_windows(shared);
     }
 
     /// Update window counts from the window cache.
@@ -404,39 +415,39 @@ impl NiriBackend {
     }
 
     /// Update per-output active window info from window cache and workspace state.
+    ///
+    /// Each output shows the window on its visible workspace that has keyboard
+    /// focus, otherwise the workspace's active window, otherwise nothing.
     fn update_per_output_windows(shared: &SharedState) {
         let win_cache = shared.windows.read();
         let id_to_output = shared.id_to_output.read();
         let snapshot = shared.workspace_snapshot.read();
+        let active_windows = shared.active_windows.read();
         let mut per_output = shared.per_output_window.write();
 
-        // For each output, find the window to display on its active workspace
+        // Rebuild from scratch so removed outputs aren't emitted again.
+        per_output.clear();
+
         for (out_name, per_out) in &snapshot.per_output {
             // Find active workspace's niri ID for this output
             let active_ws_id = id_to_output.iter().find_map(|(&ws_id, out)| {
-                if out == out_name {
-                    let stable_id = ws_id as i32;
-                    per_out
-                        .active_workspace
-                        .contains(&stable_id)
-                        .then_some(ws_id)
-                } else {
-                    None
-                }
+                (out == out_name && per_out.active_workspace.contains(&(ws_id as i32)))
+                    .then_some(ws_id)
             });
+            // The output showing the globally focused workspace.
+            let focused =
+                active_ws_id.is_some_and(|id| snapshot.active_workspace.contains(&(id as i32)));
 
-            // Find best window on that workspace (prefer focused)
             let win_info = active_ws_id.and_then(|ws_id| {
-                let mut best: Option<&WindowData> = None;
-                for win in win_cache.values() {
-                    if win.workspace_id == Some(ws_id) {
-                        if win.is_focused {
-                            return Some(win);
-                        }
-                        best = best.or(Some(win));
-                    }
-                }
-                best
+                win_cache
+                    .values()
+                    .find(|win| win.workspace_id == Some(ws_id) && win.is_focused)
+                    .or_else(|| {
+                        active_windows
+                            .get(&ws_id)
+                            .and_then(|win_id| win_cache.get(win_id))
+                            .filter(|win| win.workspace_id == Some(ws_id))
+                    })
             });
 
             let info = win_info
@@ -444,9 +455,11 @@ impl NiriBackend {
                     title: win.title.clone(),
                     app_id: win.app_id.clone(),
                     output: Some(out_name.clone()),
+                    focused,
                 })
                 .unwrap_or_else(|| WindowInfo {
                     output: Some(out_name.clone()),
+                    focused,
                     ..Default::default()
                 });
 
@@ -475,6 +488,7 @@ impl NiriBackend {
                 title: win.title.clone(),
                 app_id: win.app_id.clone(),
                 output,
+                focused: true,
             });
             break;
         }
@@ -537,7 +551,6 @@ impl NiriBackend {
         Self::update_window_counts(shared);
 
         // If the window is focused, update focused window.
-        // Focus updates are used by WindowTitleService to display the active window title.
         if is_focused {
             return Self::update_focused_window_from_cache(shared);
         }
@@ -677,6 +690,8 @@ impl NiriBackend {
             {
                 Self::process_workspaces(shared, workspaces);
                 workspace_changed = true;
+                // Workspaces may have moved between outputs.
+                window_changed = true;
             }
         } else if let Some(workspace_activated) = event.get("WorkspaceActivated") {
             let ws_niri_id = workspace_activated.get("id").and_then(|v| v.as_u64());
@@ -815,40 +830,21 @@ impl NiriBackend {
                     window_changed = true;
                 }
             }
-        } else if let Some(active_changed) = event.get("WorkspaceActiveWindowChanged") {
-            let ws_niri_id = active_changed.get("workspace_id").and_then(|v| v.as_u64());
+        } else if let Some(active_changed) = event.get("WorkspaceActiveWindowChanged")
+            && let Some(ws_id) = active_changed.get("workspace_id").and_then(|v| v.as_u64())
+        {
             let active_win_id = active_changed
                 .get("active_window_id")
                 .and_then(|v| v.as_u64());
-
-            if let Some(ws_id) = ws_niri_id {
-                let id_to_output = shared.id_to_output.read();
-
-                if let Some(output) = id_to_output.get(&ws_id).cloned() {
-                    drop(id_to_output);
-
-                    let win_info = if let Some(win_id) = active_win_id {
-                        let win_cache = shared.windows.read();
-                        win_cache.get(&win_id).map(|win| WindowInfo {
-                            title: win.title.clone(),
-                            app_id: win.app_id.clone(),
-                            output: Some(output.clone()),
-                        })
-                    } else {
-                        None
-                    };
-
-                    let mut per_output = shared.per_output_window.write();
-                    per_output.insert(
-                        output.clone(),
-                        win_info.unwrap_or(WindowInfo {
-                            output: Some(output),
-                            ..Default::default()
-                        }),
-                    );
-                    window_changed = true;
-                }
+            {
+                let mut active_windows = shared.active_windows.write();
+                match active_win_id {
+                    Some(win_id) => active_windows.insert(ws_id, win_id),
+                    None => active_windows.remove(&ws_id),
+                };
             }
+            Self::update_per_output_windows(shared);
+            window_changed = true;
         }
 
         (workspace_changed, window_changed, keyboard_layout_changed)
@@ -1217,5 +1213,133 @@ impl CompositorBackend for NiriBackend {
 impl Drop for NiriBackend {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(id: u64, ws: u64, title: &str, focused: bool) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "title": title, "app_id": format!("{title}-app"),
+            "workspace_id": ws, "is_focused": focused, "is_urgent": false,
+        })
+    }
+
+    fn workspace(
+        id: u64,
+        output: &str,
+        active: bool,
+        focused: bool,
+        window: Option<u64>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "idx": id, "name": null, "output": output,
+            "is_active": active, "is_focused": focused, "is_urgent": false,
+            "active_window_id": window,
+        })
+    }
+
+    fn shown(shared: &SharedState, output: &str) -> (String, bool) {
+        let per_output = shared.per_output_window.read();
+        let info = per_output.get(output).expect("output has an entry");
+        (info.title.clone(), info.focused)
+    }
+
+    fn shown_focused(shared: &SharedState) -> String {
+        let per_output = shared.per_output_window.read();
+        let focused: Vec<_> = per_output.values().filter(|info| info.focused).collect();
+        assert_eq!(focused.len(), 1, "exactly one focused output");
+        focused[0].title.clone()
+    }
+
+    /// Workspace 1 (DP-1, focused) has five windows with B (id 4) active;
+    /// workspace 2 (DP-1) is empty; DP-2 shows workspace 3 with window X and
+    /// hides workspace 4 with window Y.
+    fn setup() -> SharedState {
+        let shared = SharedState::default();
+        NiriBackend::handle_event(
+            &shared,
+            &serde_json::json!({"WorkspacesChanged": {"workspaces": [
+                workspace(1, "DP-1", true, true, Some(4)),
+                workspace(2, "DP-1", false, false, None),
+                workspace(3, "DP-2", true, false, Some(10)),
+                workspace(4, "DP-2", false, false, Some(11)),
+            ]}}),
+        );
+        NiriBackend::handle_event(
+            &shared,
+            &serde_json::json!({"WindowsChanged": {"windows": [
+                window(1, 1, "A1", false),
+                window(2, 1, "A2", false),
+                window(3, 1, "A3", false),
+                window(4, 1, "B", true),
+                window(5, 1, "A5", false),
+                window(10, 3, "X", false),
+                window(11, 4, "Y", false),
+            ]}}),
+        );
+        shared
+    }
+
+    #[test]
+    fn layer_shell_focus_keeps_the_active_window() {
+        let shared = setup();
+        assert_eq!(shown_focused(&shared), "B");
+
+        // A layer-shell surface (e.g. a popover) takes the keyboard.
+        let (_, changed, _) = NiriBackend::handle_event(
+            &shared,
+            &serde_json::json!({"WindowFocusChanged": {"id": null}}),
+        );
+        assert!(changed);
+        assert_eq!(shown(&shared, "DP-1"), ("B".to_string(), true));
+
+        // The title still updates while the popover has focus.
+        NiriBackend::handle_event(
+            &shared,
+            &serde_json::json!({"WindowOpenedOrChanged": {
+                "window": window(4, 1, "B renamed", false)
+            }}),
+        );
+        assert_eq!(shown_focused(&shared), "B renamed");
+
+        // Focus returns to the window.
+        NiriBackend::handle_event(
+            &shared,
+            &serde_json::json!({"WindowFocusChanged": {"id": 4}}),
+        );
+        assert_eq!(shown_focused(&shared), "B renamed");
+    }
+
+    #[test]
+    fn unfocused_output_shows_its_active_window() {
+        let shared = setup();
+        assert_eq!(shown(&shared, "DP-2"), ("X".to_string(), false));
+
+        // An active-window change on a hidden workspace leaves DP-2 alone.
+        NiriBackend::handle_event(
+            &shared,
+            &serde_json::json!({"WorkspaceActiveWindowChanged": {
+                "workspace_id": 4, "active_window_id": 11
+            }}),
+        );
+        assert_eq!(shown(&shared, "DP-2"), ("X".to_string(), false));
+    }
+
+    #[test]
+    fn empty_workspace_clears_the_title() {
+        let shared = setup();
+        NiriBackend::handle_event(
+            &shared,
+            &serde_json::json!({"WorkspaceActivated": {"id": 2, "focused": true}}),
+        );
+        NiriBackend::handle_event(
+            &shared,
+            &serde_json::json!({"WindowFocusChanged": {"id": null}}),
+        );
+
+        assert_eq!(shown(&shared, "DP-1"), (String::new(), true));
     }
 }

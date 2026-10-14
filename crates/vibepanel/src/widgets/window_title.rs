@@ -1,6 +1,10 @@
 //! Window title widget - displays the focused window's title.
 //!
 //! Shows the title of the currently focused window with optional app icon.
+//!
+//! - `filter_by_output`: `true` (default) shows the window on this bar's
+//!   output, keeping it while focus is on another output; `false` shows the
+//!   globally focused window on every bar.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -12,10 +16,11 @@ use tracing::{debug, trace};
 use vibepanel_core::config::WidgetEntry;
 
 use crate::services::callbacks::CallbackId;
+use crate::services::compositor::WindowInfo;
 use crate::services::config_manager::ConfigManager;
 use crate::services::icons::get_app_icon_name;
 use crate::services::tooltip::TooltipManager;
-use crate::services::window_title::{WindowTitleService, WindowTitleSnapshot};
+use crate::services::window_title::WindowTitleService;
 use crate::styles::{icon, widget as wgt};
 use crate::widgets::WidgetConfig;
 use crate::widgets::base::BaseWidget;
@@ -27,6 +32,7 @@ const DEFAULT_SHOW_APP_FALLBACK: bool = true;
 const DEFAULT_MAX_CHARS: i32 = 0;
 const DEFAULT_SHOW_ICON: bool = true;
 const DEFAULT_UPPERCASE: bool = false;
+const DEFAULT_FILTER_BY_OUTPUT: bool = true;
 
 /// Configuration for the window title widget.
 #[derive(Debug, Clone)]
@@ -46,6 +52,9 @@ pub struct WindowTitleConfig {
     pub icon_size: Option<i32>,
     /// Whether to uppercase the title.
     pub uppercase: bool,
+    /// Whether to show this bar output's window (`true`) or the globally
+    /// focused window (`false`).
+    pub filter_by_output: bool,
 }
 
 impl WidgetConfig for WindowTitleConfig {
@@ -61,6 +70,7 @@ impl WidgetConfig for WindowTitleConfig {
                 "show_icon",
                 "icon_size",
                 "uppercase",
+                "filter_by_output",
             ],
         );
 
@@ -109,6 +119,12 @@ impl WidgetConfig for WindowTitleConfig {
             .and_then(|v| v.as_bool())
             .unwrap_or(DEFAULT_UPPERCASE);
 
+        let filter_by_output = entry
+            .options
+            .get("filter_by_output")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(DEFAULT_FILTER_BY_OUTPUT);
+
         Self {
             empty_text,
             template,
@@ -117,6 +133,7 @@ impl WidgetConfig for WindowTitleConfig {
             show_icon,
             icon_size,
             uppercase,
+            filter_by_output,
         }
     }
 }
@@ -131,6 +148,7 @@ impl Default for WindowTitleConfig {
             show_icon: DEFAULT_SHOW_ICON,
             icon_size: None,
             uppercase: DEFAULT_UPPERCASE,
+            filter_by_output: DEFAULT_FILTER_BY_OUTPUT,
         }
     }
 }
@@ -153,7 +171,7 @@ impl WindowTitleWidget {
     /// Create a new window title widget with the given configuration.
     ///
     /// The `output_id` parameter is the monitor connector name (e.g., "eDP-1")
-    /// used to filter window title updates to only show windows on this monitor.
+    /// used to show only this monitor's window when `filter_by_output` is set.
     /// If `None`, the widget shows the globally focused window regardless of monitor.
     pub fn new(config: WindowTitleConfig, output_id: Option<String>) -> Self {
         let base = BaseWidget::new(&[wgt::WINDOW_TITLE]);
@@ -232,28 +250,20 @@ impl WindowTitleWidget {
         let app_name_cache = Rc::new(RefCell::new(HashMap::<String, String>::new()));
         let base_widget = base.widget().clone();
 
-        // Clone output_id for debug log (the original moves into the closure)
+        // Only follow this bar's output when filtering by output.
+        let output_id = output_id.filter(|_| config.filter_by_output);
         let output_id_for_log = output_id.clone();
 
         // Connect to window title service.
         // The callback owns clones of the GTK widgets and config.
-        // Each widget remembers its last state - we only update when a window
-        // on THIS monitor gains focus, otherwise we keep showing the last value.
+        // Backends emit one update per output; keep the ones this widget follows.
         let window_title_callback_id = WindowTitleService::global().connect(move |snapshot| {
-            // Filter by output_id if specified
-            if let Some(ref target_output) = output_id {
-                // Only update if window is on this monitor
-                if let Some(ref window_output) = snapshot.output
-                    && window_output != target_output
-                {
-                    // Window is on a different monitor - keep current display, don't update
-                    trace!(
-                        "WindowTitle: ignoring update for {}, window is on {}",
-                        target_output, window_output
-                    );
-                    return;
-                }
-                // If snapshot.output is None, we show it (compositor doesn't report output)
+            if !accepts_update(output_id.as_deref(), snapshot) {
+                trace!(
+                    "WindowTitle: ignoring update for {:?} (focused={}), widget follows {:?}",
+                    snapshot.output, snapshot.focused, output_id
+                );
+                return;
             }
 
             // Update the widget with the new window info
@@ -281,6 +291,16 @@ impl WindowTitleWidget {
     /// Get the root GTK widget for embedding in the bar.
     pub fn widget(&self) -> &gtk4::Box {
         self.base.widget()
+    }
+}
+
+/// Whether a widget following `output_id` (or the focused output when `None`)
+/// should apply this update. Unscoped updates apply everywhere.
+fn accepts_update(output_id: Option<&str>, snapshot: &WindowInfo) -> bool {
+    match (output_id, snapshot.output.as_deref()) {
+        (_, None) => true,
+        (Some(target), Some(output)) => target == output,
+        (None, Some(_)) => snapshot.focused,
     }
 }
 
@@ -330,7 +350,7 @@ fn update_window_title(
     base_widget: &GtkBox,
     config: &WindowTitleConfig,
     app_name_cache: &Rc<RefCell<HashMap<String, String>>>,
-    snapshot: &WindowTitleSnapshot,
+    snapshot: &WindowInfo,
     is_vertical: bool,
 ) {
     let text = render_title(config, app_name_cache, snapshot);
@@ -390,7 +410,7 @@ fn set_label_alignment(title_label: &WindowTitleLabel, is_vertical: bool, icon_v
 fn render_title(
     config: &WindowTitleConfig,
     app_name_cache: &Rc<RefCell<HashMap<String, String>>>,
-    snapshot: &WindowTitleSnapshot,
+    snapshot: &WindowInfo,
 ) -> String {
     let friendly_app = friendly_app_name(app_name_cache, &snapshot.app_id);
 
@@ -614,7 +634,7 @@ fn friendly_app_name(cache: &Rc<RefCell<HashMap<String, String>>>, app_id: &str)
 }
 
 /// Update the icon based on current app_id.
-fn update_icon(icon: &Image, icon_root: &GtkBox, snapshot: &WindowTitleSnapshot) -> bool {
+fn update_icon(icon: &Image, icon_root: &GtkBox, snapshot: &WindowInfo) -> bool {
     if snapshot.app_id.is_empty() {
         icon_root.set_visible(false);
         return false;
@@ -641,7 +661,7 @@ fn update_tooltip(
     base_widget: &GtkBox,
     config: &WindowTitleConfig,
     app_name_cache: &Rc<RefCell<HashMap<String, String>>>,
-    snapshot: &WindowTitleSnapshot,
+    snapshot: &WindowInfo,
 ) {
     let friendly = friendly_app_name(app_name_cache, &snapshot.app_id);
 
@@ -706,6 +726,33 @@ mod tests {
         assert!(config.show_icon);
         assert_eq!(config.icon_size, None);
         assert!(!config.uppercase);
+        assert!(config.filter_by_output);
+    }
+
+    #[test]
+    fn accepts_update_follows_output_or_focus() {
+        let snapshot = |output: Option<&str>, focused| WindowInfo {
+            output: output.map(str::to_string),
+            focused,
+            ..Default::default()
+        };
+
+        // (widget's output, update's output, update focused, accepted)
+        let cases = [
+            (Some("DP-1"), Some("DP-1"), false, true), // own output
+            (Some("DP-1"), Some("DP-2"), true, false), // other output, even focused
+            (None, Some("DP-2"), true, true),          // following focus
+            (None, Some("DP-1"), false, false),        // following focus, unfocused
+            (Some("DP-1"), None, false, true),         // unscoped update
+            (None, None, false, true),                 // unscoped update
+        ];
+        for (widget, output, focused, expected) in cases {
+            assert_eq!(
+                accepts_update(widget, &snapshot(output, focused)),
+                expected,
+                "widget={widget:?} output={output:?} focused={focused}"
+            );
+        }
     }
 
     #[test]
