@@ -397,6 +397,25 @@ impl SwayBackend {
         *shared.focused_window.write() = focused_window;
     }
 
+    /// The focused window, or an empty update scoped to the focused output so
+    /// an empty workspace only clears the title on its own bar.
+    fn window_update(shared: &SharedState) -> WindowInfo {
+        shared.focused_window.read().clone().unwrap_or_else(|| {
+            let active = &shared.workspace_snapshot.read().active_workspace;
+            let output = shared
+                .workspaces
+                .read()
+                .iter()
+                .find(|ws| active.contains(&ws.id))
+                .and_then(|ws| ws.output.clone());
+            WindowInfo {
+                output,
+                focused: true,
+                ..Default::default()
+            }
+        })
+    }
+
     /// Count leaf windows (application windows) in a container subtree.
     ///
     /// Uses `pid > 0` to identify windows (per Sway IPC spec, `pid` is set only
@@ -567,15 +586,7 @@ impl SwayBackend {
 
         if let Some((ref ws_cb, ref win_cb)) = callbacks {
             ws_cb(shared.workspace_snapshot.read().clone());
-            // TODO: with nothing focused, this unscoped update (and the one in
-            // the event loop) clears every bar, even with filter_by_output, and
-            // wipes the manager's replay cache. Scope it to the focused output
-            // with `focused: true`, like Hyprland's `window_update()`.
-            if let Some(ref win) = *shared.focused_window.read() {
-                win_cb(win.clone());
-            } else {
-                win_cb(WindowInfo::default());
-            }
+            win_cb(Self::window_update(&shared));
         }
         if let Some(ref kb_cb) = kb_callback
             && let Some(ref info) = *shared.keyboard_layout.read()
@@ -680,11 +691,7 @@ impl SwayBackend {
                                 ws_cb(shared.workspace_snapshot.read().clone());
                             }
                             if win_changed {
-                                if let Some(ref win) = *shared.focused_window.read() {
-                                    win_cb(win.clone());
-                                } else {
-                                    win_cb(WindowInfo::default());
-                                }
+                                win_cb(Self::window_update(&shared));
                             }
                         }
 
@@ -989,5 +996,25 @@ mod tests {
         assert_eq!(ws_list[2].idx, 10);
         assert_eq!(ws_list[3].name, "web");
         assert_eq!(ws_list[3].idx, -1);
+    }
+
+    #[test]
+    fn empty_window_update_is_scoped_to_focused_output() {
+        let workspaces = vec![
+            serde_json::json!({ "num": 1, "name": "1", "output": "DP-1", "focused": false }),
+            serde_json::json!({ "num": 2, "name": "2", "output": "DP-2", "focused": true }),
+        ];
+        let shared = SharedState::default();
+        let ws_list = SwayBackend::workspace_meta_from_ipc(
+            &workspaces,
+            &mut shared.workspace_snapshot.write(),
+        );
+        *shared.workspaces.write() = ws_list;
+
+        let info = SwayBackend::window_update(&shared);
+
+        assert_eq!(info.output.as_deref(), Some("DP-2"));
+        assert!(info.focused);
+        assert!(info.title.is_empty());
     }
 }
