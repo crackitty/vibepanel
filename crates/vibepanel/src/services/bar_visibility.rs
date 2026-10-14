@@ -17,7 +17,7 @@ use crate::services::callbacks::CallbackId;
 use crate::services::compositor::CompositorManager;
 use crate::services::compositor::visibility::{HideDecision, Rect, VisibilitySubscription};
 use crate::services::config_manager::ConfigManager;
-use crate::widgets::layer_shell_popover::{AnimDirection, AnimState};
+use crate::widgets::layer_shell_popover::{AnimDirection, AnimState, transparent_buffer};
 
 #[derive(Default)]
 struct Policy {
@@ -688,16 +688,6 @@ impl BarVisibilityController {
             *self.input_state.borrow_mut() = Some(rects);
         }
     }
-}
-
-fn transparent_buffer() -> gtk4::DrawingArea {
-    let area = gtk4::DrawingArea::new();
-    area.set_draw_func(|_, cr, _, _| {
-        cr.set_operator(gtk4::cairo::Operator::Source);
-        cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
-        let _ = cr.paint();
-    });
-    area
 }
 
 fn has_open_native_popover(widget: &gtk4::Widget) -> bool {

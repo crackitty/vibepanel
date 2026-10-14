@@ -815,6 +815,18 @@ pub(crate) fn calculate_bar_exclusive_zone_for(
     }
 }
 
+/// A widget that paints transparent pixels. Unlike an empty widget it always
+/// produces render content, so the surface gets a real buffer.
+pub(crate) fn transparent_buffer() -> gtk4::DrawingArea {
+    let area = gtk4::DrawingArea::new();
+    area.set_draw_func(|_, cr, _, _| {
+        cr.set_operator(gtk4::cairo::Operator::Source);
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
+        let _ = cr.paint();
+    });
+    area
+}
+
 /// Create a click-catcher layer-shell surface.
 ///
 /// The click-catcher is a fullscreen transparent surface that sits behind popovers
@@ -857,8 +869,9 @@ where
 
     catcher.set_margin(popover_bar_edge(), bar_zone);
 
-    // Content - add CSS class to the child widget for background styling
-    let overlay = GtkBox::new(Orientation::Vertical, 0);
+    // Content - add CSS class to the child widget for background styling.
+    // Without a buffer some compositors (mango) let clicks pass through.
+    let overlay = transparent_buffer();
     overlay.set_hexpand(true);
     overlay.set_vexpand(true);
     overlay.add_css_class(class::CLICK_CATCHER); // Apply background to child

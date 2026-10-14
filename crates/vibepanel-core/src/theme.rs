@@ -19,8 +19,8 @@ const OVERLAY_OPACITY_LIGHT: f64 = 0.14;
 // Overlay multipliers for interactive states
 const HOVER_MULTIPLIER: f64 = 2.2;
 
-// Click catcher: nearly invisible but clickable
-const CLICK_CATCHER_OPACITY: f64 = 0.005;
+// Click catcher: invisible, stays clickable via its transparent buffer
+const CLICK_CATCHER_OPACITY: f64 = 0.0;
 
 // Border opacities (subtle borders that don't compete with content)
 pub const BORDER_OPACITY_DARK: f64 = 0.10;
