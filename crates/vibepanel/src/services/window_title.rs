@@ -12,30 +12,6 @@ use tracing::debug;
 use super::callbacks::{CallbackId, Callbacks};
 use super::compositor::{CompositorManager, WindowInfo};
 
-/// Snapshot of window title service state for callbacks.
-#[derive(Debug, Clone, Default)]
-pub struct WindowTitleSnapshot {
-    /// Current window title.
-    pub title: String,
-    /// Current application ID.
-    pub app_id: String,
-    /// Output/monitor name (if available).
-    pub output: Option<String>,
-    /// Whether this is the globally focused output.
-    pub focused: bool,
-}
-
-impl From<&WindowInfo> for WindowTitleSnapshot {
-    fn from(info: &WindowInfo) -> Self {
-        Self {
-            title: info.title.clone(),
-            app_id: info.app_id.clone(),
-            output: info.output.clone(),
-            focused: info.focused,
-        }
-    }
-}
-
 /// Shared, process-wide window title service.
 ///
 /// Provides reactive window title state with GTK main loop integration.
@@ -43,7 +19,7 @@ impl From<&WindowInfo> for WindowTitleSnapshot {
 /// filter for the output (or focus) they care about.
 pub struct WindowTitleService {
     /// Registered callbacks.
-    callbacks: Callbacks<WindowTitleSnapshot>,
+    callbacks: Callbacks<WindowInfo>,
 }
 
 impl WindowTitleService {
@@ -71,13 +47,13 @@ impl WindowTitleService {
     /// The callback is always executed on the GLib main loop.
     pub fn connect<F>(&self, callback: F) -> CallbackId
     where
-        F: Fn(&WindowTitleSnapshot) + 'static,
+        F: Fn(&WindowInfo) + 'static,
     {
         let id = self.callbacks.register(callback);
 
         // Immediately replay every output so this widget can render.
         for info in CompositorManager::global().window_updates() {
-            self.callbacks.notify_single(id, &(&info).into());
+            self.callbacks.notify_single(id, &info);
         }
         id
     }
@@ -88,7 +64,7 @@ impl WindowTitleService {
     }
 
     fn handle_update(&self, window_info: &WindowInfo) {
-        self.callbacks.notify(&window_info.into());
+        self.callbacks.notify(window_info);
     }
 
     fn register_with_manager(this: &Rc<Self>, manager: &Rc<CompositorManager>) {

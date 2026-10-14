@@ -16,10 +16,11 @@ use tracing::{debug, trace};
 use vibepanel_core::config::WidgetEntry;
 
 use crate::services::callbacks::CallbackId;
+use crate::services::compositor::WindowInfo;
 use crate::services::config_manager::ConfigManager;
 use crate::services::icons::get_app_icon_name;
 use crate::services::tooltip::TooltipManager;
-use crate::services::window_title::{WindowTitleService, WindowTitleSnapshot};
+use crate::services::window_title::WindowTitleService;
 use crate::styles::{icon, widget as wgt};
 use crate::widgets::WidgetConfig;
 use crate::widgets::base::BaseWidget;
@@ -295,7 +296,7 @@ impl WindowTitleWidget {
 
 /// Whether a widget following `output_id` (or the focused output when `None`)
 /// should apply this update. Unscoped updates apply everywhere.
-fn accepts_update(output_id: Option<&str>, snapshot: &WindowTitleSnapshot) -> bool {
+fn accepts_update(output_id: Option<&str>, snapshot: &WindowInfo) -> bool {
     match (output_id, snapshot.output.as_deref()) {
         (_, None) => true,
         (Some(target), Some(output)) => target == output,
@@ -349,7 +350,7 @@ fn update_window_title(
     base_widget: &GtkBox,
     config: &WindowTitleConfig,
     app_name_cache: &Rc<RefCell<HashMap<String, String>>>,
-    snapshot: &WindowTitleSnapshot,
+    snapshot: &WindowInfo,
     is_vertical: bool,
 ) {
     let text = render_title(config, app_name_cache, snapshot);
@@ -409,7 +410,7 @@ fn set_label_alignment(title_label: &WindowTitleLabel, is_vertical: bool, icon_v
 fn render_title(
     config: &WindowTitleConfig,
     app_name_cache: &Rc<RefCell<HashMap<String, String>>>,
-    snapshot: &WindowTitleSnapshot,
+    snapshot: &WindowInfo,
 ) -> String {
     let friendly_app = friendly_app_name(app_name_cache, &snapshot.app_id);
 
@@ -633,7 +634,7 @@ fn friendly_app_name(cache: &Rc<RefCell<HashMap<String, String>>>, app_id: &str)
 }
 
 /// Update the icon based on current app_id.
-fn update_icon(icon: &Image, icon_root: &GtkBox, snapshot: &WindowTitleSnapshot) -> bool {
+fn update_icon(icon: &Image, icon_root: &GtkBox, snapshot: &WindowInfo) -> bool {
     if snapshot.app_id.is_empty() {
         icon_root.set_visible(false);
         return false;
@@ -660,7 +661,7 @@ fn update_tooltip(
     base_widget: &GtkBox,
     config: &WindowTitleConfig,
     app_name_cache: &Rc<RefCell<HashMap<String, String>>>,
-    snapshot: &WindowTitleSnapshot,
+    snapshot: &WindowInfo,
 ) {
     let friendly = friendly_app_name(app_name_cache, &snapshot.app_id);
 
@@ -730,7 +731,7 @@ mod tests {
 
     #[test]
     fn accepts_update_follows_output_or_focus() {
-        let snapshot = |output: Option<&str>, focused| WindowTitleSnapshot {
+        let snapshot = |output: Option<&str>, focused| WindowInfo {
             output: output.map(str::to_string),
             focused,
             ..Default::default()
