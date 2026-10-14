@@ -716,6 +716,7 @@ fn apply_focused_window_from_monitors(shared: &Arc<MangoSharedState>, value: &Va
             .unwrap_or_default()
             .to_string(),
         output: Some(output.to_string()),
+        focused: true,
     };
 
     let changed = *shared.focused_client_id.read() != focused_client_id
@@ -1308,6 +1309,7 @@ mod tests {
             shared.focused_window.read().clone(),
             Some(WindowInfo {
                 output: Some("HDMI-A-1".to_string()),
+                focused: true,
                 ..Default::default()
             })
         );

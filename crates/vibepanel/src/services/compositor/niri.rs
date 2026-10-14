@@ -444,6 +444,7 @@ impl NiriBackend {
                     title: win.title.clone(),
                     app_id: win.app_id.clone(),
                     output: Some(out_name.clone()),
+                    focused: false,
                 })
                 .unwrap_or_else(|| WindowInfo {
                     output: Some(out_name.clone()),
@@ -452,6 +453,36 @@ impl NiriBackend {
 
             per_output.insert(out_name.clone(), info);
         }
+    }
+
+    /// Output holding the globally focused workspace.
+    fn focused_output(shared: &SharedState) -> Option<String> {
+        let active = *shared
+            .workspace_snapshot
+            .read()
+            .active_workspace
+            .iter()
+            .next()?;
+        shared
+            .id_to_output
+            .read()
+            .iter()
+            .find(|&(&ws_id, _)| ws_id as i32 == active)
+            .map(|(_, output)| output.clone())
+    }
+
+    /// Per-output window updates, with the focused output marked.
+    fn output_window_updates(shared: &SharedState) -> Vec<WindowInfo> {
+        let focused_output = Self::focused_output(shared);
+        shared
+            .per_output_window
+            .read()
+            .values()
+            .map(|info| WindowInfo {
+                focused: info.output.is_some() && info.output == focused_output,
+                ..info.clone()
+            })
+            .collect()
     }
 
     /// Update focused window info from window cache.
@@ -475,6 +506,7 @@ impl NiriBackend {
                 title: win.title.clone(),
                 app_id: win.app_id.clone(),
                 output,
+                focused: true,
             });
             break;
         }
@@ -833,6 +865,7 @@ impl NiriBackend {
                             title: win.title.clone(),
                             app_id: win.app_id.clone(),
                             output: Some(output.clone()),
+                            focused: false,
                         })
                     } else {
                         None
@@ -870,9 +903,8 @@ impl NiriBackend {
         if let Some((ref ws_cb, ref win_cb)) = callbacks {
             ws_cb(shared.workspace_snapshot.read().clone());
             // Emit window info for all outputs (including empty info for outputs with no active window)
-            let per_output = shared.per_output_window.read();
-            for win_info in per_output.values() {
-                win_cb(win_info.clone());
+            for win_info in Self::output_window_updates(&shared) {
+                win_cb(win_info);
             }
         }
 
@@ -971,9 +1003,8 @@ impl NiriBackend {
                                     }
                                     if win_changed {
                                         // Emit updates for all outputs with their current active window
-                                        let per_output = shared.per_output_window.read();
-                                        for win_info in per_output.values() {
-                                            win_cb(win_info.clone());
+                                        for win_info in Self::output_window_updates(&shared) {
+                                            win_cb(win_info);
                                         }
                                     }
                                 }
@@ -1217,5 +1248,37 @@ impl CompositorBackend for NiriBackend {
 impl Drop for NiriBackend {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_window_updates_mark_the_focused_output() {
+        let shared = SharedState::default();
+        *shared.id_to_output.write() =
+            HashMap::from([(1, "DP-1".to_string()), (2, "DP-2".to_string())]);
+        shared.workspace_snapshot.write().active_workspace.insert(2);
+        for output in ["DP-1", "DP-2"] {
+            shared.per_output_window.write().insert(
+                output.to_string(),
+                WindowInfo {
+                    output: Some(output.to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let updates = NiriBackend::output_window_updates(&shared);
+
+        let focused: Vec<_> = updates
+            .iter()
+            .filter(|info| info.focused)
+            .map(|info| info.output.as_deref())
+            .collect();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(focused, vec![Some("DP-2")]);
     }
 }

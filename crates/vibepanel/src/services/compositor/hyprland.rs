@@ -901,6 +901,7 @@ impl HyprlandBackend {
             title,
             app_id,
             output,
+            focused: true,
         })
     }
 
@@ -910,6 +911,7 @@ impl HyprlandBackend {
         let focused = self.shared.focused_window.read().clone();
         focused.unwrap_or_else(|| WindowInfo {
             output: self.shared.focused_monitor.read().clone(),
+            focused: true,
             ..Default::default()
         })
     }
@@ -1641,6 +1643,7 @@ mod tests {
             title: "t".to_string(),
             app_id: "a".to_string(),
             output: Some("DP-3".to_string()),
+            focused: true,
         });
         let (_, window_changed, _) = backend.handle_event("focusedmon>>DP-1,3");
         assert!(!window_changed);

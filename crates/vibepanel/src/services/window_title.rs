@@ -1,11 +1,10 @@
 //! WindowTitleService - shared, event-driven window title state via CompositorManager.
 //!
-//! This provides a GTK-friendly API for focused window information:
-//! - Uses the shared CompositorManager singleton
-//! - Provides current window info access
+//! This provides a GTK-friendly API for per-output window information:
+//! - Uses the shared CompositorManager singleton, which keeps the latest
+//!   window for every output
 //! - Supports callback registration for reactive updates
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use tracing::debug;
@@ -22,16 +21,8 @@ pub struct WindowTitleSnapshot {
     pub app_id: String,
     /// Output/monitor name (if available).
     pub output: Option<String>,
-}
-
-impl From<WindowInfo> for WindowTitleSnapshot {
-    fn from(info: WindowInfo) -> Self {
-        Self {
-            title: info.title,
-            app_id: info.app_id,
-            output: info.output,
-        }
-    }
+    /// Whether this is the globally focused output.
+    pub focused: bool,
 }
 
 impl From<&WindowInfo> for WindowTitleSnapshot {
@@ -40,6 +31,7 @@ impl From<&WindowInfo> for WindowTitleSnapshot {
             title: info.title.clone(),
             app_id: info.app_id.clone(),
             output: info.output.clone(),
+            focused: info.focused,
         }
     }
 }
@@ -47,35 +39,20 @@ impl From<&WindowInfo> for WindowTitleSnapshot {
 /// Shared, process-wide window title service.
 ///
 /// Provides reactive window title state with GTK main loop integration.
-/// Widgets should call `connect()` to receive updates when the focused window changes.
+/// Widgets should call `connect()` to receive per-output window updates and
+/// filter for the output (or focus) they care about.
 pub struct WindowTitleService {
-    /// Current window info.
-    current: RefCell<WindowTitleSnapshot>,
     /// Registered callbacks.
     callbacks: Callbacks<WindowTitleSnapshot>,
-    /// Whether the service has received at least one update.
-    ready: RefCell<bool>,
 }
 
 impl WindowTitleService {
     fn new() -> Rc<Self> {
-        // Get the shared compositor manager
-        let manager = CompositorManager::global();
-
-        // Get initial state from manager
-        let initial: WindowTitleSnapshot = manager
-            .get_focused_window()
-            .map(|info| (&info).into())
-            .unwrap_or_default();
-
         let service = Rc::new(Self {
-            current: RefCell::new(initial),
             callbacks: Callbacks::new(),
-            ready: RefCell::new(true), // Ready immediately since manager handles startup
         });
 
-        // Register with compositor manager
-        Self::register_with_manager(&service, &manager);
+        Self::register_with_manager(&service, &CompositorManager::global());
 
         debug!("WindowTitleService initialized (using CompositorManager)");
         service
@@ -90,7 +67,7 @@ impl WindowTitleService {
         INSTANCE.with(|s| s.clone())
     }
 
-    /// Register a callback to be invoked when window title changes.
+    /// Register a callback to be invoked when an output's window changes.
     /// The callback is always executed on the GLib main loop.
     pub fn connect<F>(&self, callback: F) -> CallbackId
     where
@@ -98,10 +75,9 @@ impl WindowTitleService {
     {
         let id = self.callbacks.register(callback);
 
-        // Immediately send current state so this widget can render.
-        if *self.ready.borrow() {
-            let snapshot = self.current.borrow().clone();
-            self.callbacks.notify_single(id, &snapshot);
+        // Immediately replay every output so this widget can render.
+        for info in CompositorManager::global().window_updates() {
+            self.callbacks.notify_single(id, &(&info).into());
         }
         id
     }
@@ -112,13 +88,7 @@ impl WindowTitleService {
     }
 
     fn handle_update(&self, window_info: &WindowInfo) {
-        // Update stored state
-        let snapshot: WindowTitleSnapshot = window_info.into();
-        *self.current.borrow_mut() = snapshot.clone();
-        *self.ready.borrow_mut() = true;
-
-        // Notify callbacks.
-        self.callbacks.notify(&snapshot);
+        self.callbacks.notify(&window_info.into());
     }
 
     fn register_with_manager(this: &Rc<Self>, manager: &Rc<CompositorManager>) {

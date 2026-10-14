@@ -476,6 +476,7 @@ impl SwayBackend {
                 title,
                 app_id,
                 output: Some(output_name.to_string()),
+                focused: true,
             });
         }
 
@@ -566,6 +567,10 @@ impl SwayBackend {
 
         if let Some((ref ws_cb, ref win_cb)) = callbacks {
             ws_cb(shared.workspace_snapshot.read().clone());
+            // TODO: with nothing focused, this unscoped update (and the one in
+            // the event loop) clears every bar, even with filter_by_output, and
+            // wipes the manager's replay cache. Scope it to the focused output
+            // with `focused: true`, like Hyprland's `window_update()`.
             if let Some(ref win) = *shared.focused_window.read() {
                 win_cb(win.clone());
             } else {
