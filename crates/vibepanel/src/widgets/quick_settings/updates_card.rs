@@ -101,15 +101,13 @@ pub fn build_updates_card(
             // Only act on activation, not deactivation
             if toggle.is_active() {
                 let snapshot = UpdatesService::global().snapshot();
-                if let Some(pm) = snapshot.package_manager {
-                    // Close the panel before spawning terminal
-                    if let Some(qs) = current_quick_settings_window() {
-                        qs.hide_panel();
+                match spawn_upgrade_terminal(snapshot.package_manager) {
+                    Ok(()) => {
+                        if let Some(qs) = current_quick_settings_window() {
+                            qs.hide_panel();
+                        }
                     }
-
-                    if let Err(e) = spawn_upgrade_terminal(pm, None) {
-                        tracing::error!("Failed to spawn upgrade terminal: {}", e);
-                    }
+                    Err(e) => tracing::error!("Failed to spawn upgrade terminal: {}", e),
                 }
                 // Reset toggle state (it's not a persistent toggle)
                 toggle.set_active(false);

@@ -13,6 +13,7 @@ use std::time::SystemTime;
 use gtk4::glib;
 use tracing::{debug, error, warn};
 
+use crate::services::config_manager::ConfigManager;
 use crate::services::updates::{PackageManager, UpdatesService, UpdatesSnapshot, has_flatpak};
 
 /// Get the appropriate icon name based on snapshot state.
@@ -179,25 +180,40 @@ fn which_exists(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Wrap a command so the terminal stays open until the user presses Enter.
+///
+/// Uses a newline separator (not `;`) so user commands ending in `;`, `&`,
+/// a newline, or a `# comment` still parse and still reach the prompt.
+fn wrap_for_terminal(cmd: &str) -> String {
+    format!("{cmd}\necho ''; echo 'Press Enter to close...'; read")
+}
+
 /// Spawn a terminal with the upgrade command.
 ///
+/// Reads `terminal` and `update_command` from `[widgets.updates]` at click
+/// time so the bar widget and the Quick Settings card behave identically.
+/// A custom `update_command` is preferred over the built-in command.
+///
 /// Returns an error message if spawning fails.
-pub fn spawn_upgrade_terminal(
-    package_manager: PackageManager,
-    terminal_override: Option<&str>,
-) -> Result<(), String> {
-    let terminal = terminal_override
-        .map(String::from)
+pub fn spawn_upgrade_terminal(package_manager: Option<PackageManager>) -> Result<(), String> {
+    let config = ConfigManager::global();
+    let option = |name| {
+        config
+            .get_widget_option("updates", name)
+            .and_then(|v| v.as_str().map(String::from))
+    };
+
+    let upgrade_cmd = match (option("update_command"), package_manager) {
+        (Some(cmd), _) => cmd,
+        (None, Some(pm)) => build_upgrade_command(pm),
+        (None, None) => return Err("No package manager detected".to_string()),
+    };
+
+    let terminal = option("terminal")
         .or_else(detect_terminal)
         .ok_or_else(|| "No terminal emulator found".to_string())?;
 
-    let upgrade_cmd = build_upgrade_command(package_manager);
-
-    // Build the shell command that runs upgrade and waits for user input
-    let shell_cmd = format!(
-        "{}; echo ''; echo 'Press Enter to close...'; read",
-        upgrade_cmd
-    );
+    let shell_cmd = wrap_for_terminal(&upgrade_cmd);
 
     debug!(
         "Spawning terminal '{}' with command: {}",
@@ -430,5 +446,22 @@ mod tests {
         // the test machine. We only verify the primary command prefix.
         let cmd = build_upgrade_command(PackageManager::Paru);
         assert!(cmd.starts_with("paru -Syu"));
+    }
+
+    #[test]
+    fn test_wrap_for_terminal_survives_user_command_endings() {
+        for cmd in ["true;", "true\n", "true &", "true # comment"] {
+            let output = Command::new("sh")
+                .args(["-c", &wrap_for_terminal(cmd)])
+                .stdin(Stdio::null())
+                .output()
+                .expect("sh should run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("Press Enter to close..."),
+                "prompt missing for {cmd:?}: stdout={stdout:?} stderr={:?}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }
