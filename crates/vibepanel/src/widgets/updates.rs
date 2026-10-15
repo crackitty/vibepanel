@@ -9,6 +9,7 @@
 //! Configuration options:
 //! - `check_interval`: How often to check for updates (seconds, default: 3600)
 //! - `terminal`: Override terminal emulator detection
+//! - `update_command`: Shell command to run instead of the built-in upgrade
 
 use gtk4::prelude::*;
 use gtk4::{GestureClick, Label};
@@ -31,13 +32,15 @@ const DEFAULT_CHECK_INTERVAL: u64 = 3600;
 pub struct UpdatesConfig {
     /// How often to check for updates (seconds).
     pub check_interval: u64,
-    /// Override terminal emulator detection.
-    pub terminal: Option<String>,
 }
 
 impl WidgetConfig for UpdatesConfig {
     fn from_entry(entry: &WidgetEntry) -> Self {
-        warn_unknown_options("updates", entry, &["check_interval", "terminal"]);
+        warn_unknown_options(
+            "updates",
+            entry,
+            &["check_interval", "terminal", "update_command"],
+        );
 
         let check_interval = entry
             .options
@@ -46,16 +49,7 @@ impl WidgetConfig for UpdatesConfig {
             .map(|v| v as u64)
             .unwrap_or(DEFAULT_CHECK_INTERVAL);
 
-        let terminal = entry
-            .options
-            .get("terminal")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-
-        Self {
-            check_interval,
-            terminal,
-        }
+        Self { check_interval }
     }
 }
 
@@ -63,7 +57,6 @@ impl Default for UpdatesConfig {
     fn default() -> Self {
         Self {
             check_interval: DEFAULT_CHECK_INTERVAL,
-            terminal: None,
         }
     }
 }
@@ -94,15 +87,12 @@ impl UpdatesWidget {
 
         // Set up click handler to spawn terminal
         {
-            let terminal = config.terminal.clone();
             let container = base.widget().clone();
 
             let click = GestureClick::new();
             click.connect_released(move |_, _, _, _| {
                 let snapshot = UpdatesService::global().snapshot();
-                if let Some(pm) = snapshot.package_manager
-                    && let Err(e) = spawn_upgrade_terminal(pm, terminal.as_deref())
-                {
+                if let Err(e) = spawn_upgrade_terminal(snapshot.package_manager) {
                     tracing::error!("Failed to spawn upgrade terminal: {}", e);
                 }
             });
@@ -218,17 +208,12 @@ mod tests {
         let config = UpdatesConfig::from_entry(&entry);
 
         assert_eq!(config.check_interval, DEFAULT_CHECK_INTERVAL);
-        assert!(config.terminal.is_none());
     }
 
     #[test]
     fn test_updates_config_custom() {
         let mut options = std::collections::HashMap::new();
         options.insert("check_interval".to_string(), toml::Value::Integer(1800));
-        options.insert(
-            "terminal".to_string(),
-            toml::Value::String("ghostty".to_string()),
-        );
 
         let entry = WidgetEntry {
             name: "updates".to_string(),
@@ -237,7 +222,6 @@ mod tests {
         let config = UpdatesConfig::from_entry(&entry);
 
         assert_eq!(config.check_interval, 1800);
-        assert_eq!(config.terminal, Some("ghostty".to_string()));
     }
 
     #[test]
