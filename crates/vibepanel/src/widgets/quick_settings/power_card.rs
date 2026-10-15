@@ -387,6 +387,7 @@ fn create_hold_button_card(
     overlay.add_css_class(card::BASE);
     overlay.add_css_class(qs::POWER_CARD);
     overlay.set_hexpand(true);
+    overlay.set_overflow(gtk4::Overflow::Hidden);
 
     // Progress bar (behind content, animates width)
     let progress = GtkBox::new(Orientation::Horizontal, 0);
@@ -649,6 +650,8 @@ pub fn build_power_card_expander(
     let card_overlay = Overlay::new();
     card_overlay.add_css_class(qs::POWER_CARD);
     card_overlay.set_hexpand(false); // Don't expand beyond card content
+    // Clip progress fill to rounded corners
+    card_overlay.set_overflow(gtk4::Overflow::Hidden);
 
     // Progress bar as base child (behind)
     let progress = GtkBox::new(Orientation::Horizontal, 0);
@@ -721,6 +724,7 @@ fn build_power_action_row_with_command(
     list_row.add_css_class(row::BASE);
     list_row.add_css_class(qs::POWER_ROW);
     list_row.set_activatable(false); // We handle activation via hold
+    list_row.set_overflow(gtk4::Overflow::Hidden);
 
     // Overlay structure: progress as base child (behind), content as overlay (on top)
     let overlay = Overlay::new();
