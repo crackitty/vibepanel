@@ -3,14 +3,14 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use gtk4::gdk_pixbuf::Pixbuf;
+use gtk4::gdk;
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
     Align, Box as GtkBox, Button, EventControllerLegacy, Label, Orientation, Overlay, Scale,
 };
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::services::config_manager::ConfigManager;
 use crate::services::icons::{IconHandle, IconsService};
@@ -231,8 +231,8 @@ impl ArtState {
         on_success: S,
         on_failure: F,
     ) where
-        S: Fn() + Clone + 'static,
-        F: Fn() + Clone + 'static,
+        S: Fn() + 'static,
+        F: Fn() + 'static,
     {
         {
             let mut state = art_state.borrow_mut();
@@ -720,6 +720,10 @@ pub fn load_album_art(
 /// This is the shared implementation used by both the bar widget and popover/window.
 /// - `on_success` is called after the picture is set (e.g., to hide placeholder)
 /// - `on_failure` is called when loading fails (e.g., to show placeholder or fallback icon)
+///
+/// Decoding uses GTK's own loaders (PNG, JPEG, TIFF; other formats fall back
+/// to gdk-pixbuf) on the thread pool. A cancelled or superseded load calls
+/// neither callback, so no fallback icon flashes.
 pub fn load_art_from_url<S, F>(
     url: &str,
     picture: RoundedPicture,
@@ -729,120 +733,81 @@ pub fn load_art_from_url<S, F>(
     on_success: S,
     on_failure: F,
 ) where
-    S: Fn() + Clone + 'static,
-    F: Fn() + Clone + 'static,
+    S: Fn() + 'static,
+    F: Fn() + 'static,
 {
-    let url_string = url.to_string();
+    let url = url.to_string();
     let art_state = art_state.clone();
-    let cancellable = cancellable.clone();
+    let fetch = gio::CancellableFuture::new(fetch_art_bytes(url.clone()), cancellable.clone());
 
-    if url.starts_with("file://") {
-        let file = gio::File::for_uri(url);
-        let on_success_clone = on_success.clone();
-        let on_failure_clone = on_failure.clone();
-        file.read_async(
-            glib::Priority::DEFAULT,
-            Some(&cancellable.clone()),
-            move |result| {
-                let current_gen = art_state.borrow().generation;
-                if current_gen != generation {
-                    return;
-                }
-                match result {
-                    Ok(stream) => load_texture_from_stream(
-                        stream.upcast(),
-                        &picture,
-                        &art_state,
-                        &url_string,
-                        generation,
-                        &cancellable,
-                        on_success_clone,
-                        on_failure_clone,
-                    ),
-                    Err(e) => {
-                        if e.matches(gio::IOErrorEnum::Cancelled) {
-                            // Cancelled means a newer load superseded us — don't
-                            // call on_failure which would flash a fallback icon.
-                            return;
-                        }
-                        on_failure_clone();
-                    }
-                }
-            },
-        );
-    } else if url.starts_with("http://") || url.starts_with("https://") {
-        let url_for_fetch = url.to_string();
+    glib::spawn_future_local(async move {
+        let Ok(fetched) = fetch.await else {
+            return;
+        };
+        let decoded = match fetched {
+            Ok(bytes) => gio::spawn_blocking(move || gdk::Texture::from_bytes(&bytes))
+                .await
+                .map_err(|_| "decoder panicked".to_string())
+                .and_then(|result| result.map_err(|e| e.to_string())),
+            Err(e) => Err(e),
+        };
 
-        // minreq is blocking, so spawn in thread pool
-        glib::spawn_future_local(async move {
-            let fetch_result = gio::spawn_blocking(move || {
-                let fetch = |url: &str| {
-                    minreq::get(url)
-                        .with_timeout(10)
-                        .send()
-                        .ok()
-                        .filter(|r| r.status_code >= 200 && r.status_code < 300)
-                        .map(|r| r.into_bytes())
-                };
-
-                fetch(&url_for_fetch).or_else(|| {
-                    youtube_thumbnail_fallback_url(&url_for_fetch)
-                        .and_then(|fallback| fetch(&fallback))
-                })
-            })
-            .await;
-
-            // Check if still relevant after async work
-            let current_gen = art_state.borrow().generation;
-            if current_gen != generation {
-                return;
-            }
-
-            match fetch_result {
-                Ok(Some(bytes)) => {
-                    load_texture_from_bytes(
-                        &bytes,
-                        &picture,
-                        &url_string,
-                        &on_success,
-                        &on_failure,
-                    );
-                }
-                Ok(None) => {
-                    on_failure();
-                }
-                Err(e) => {
-                    debug!("Failed to fetch album art: {:?}", e);
-                    on_failure();
-                }
-            }
-        });
-    } else if url.starts_with("data:") {
-        // mpv-mpris emits embedded cover art as a base64 data URI. Decoded
-        // synchronously — cover art is small enough not to stall the main loop.
-        // load_texture_from_bytes has no generation guard, so check here.
+        // Cancelling a load bumps the generation, which also covers a
+        // cancel that lands while the decode runs.
         if art_state.borrow().generation != generation {
             return;
         }
-
-        match decode_data_uri(url) {
-            Some(bytes) => {
-                load_texture_from_bytes(
-                    &bytes,
-                    &picture,
-                    &truncate_uri(url),
-                    &on_success,
-                    &on_failure,
-                );
+        match decoded {
+            Ok(texture) => {
+                picture.set_paintable(Some(&texture));
+                picture.set_visible(true);
+                on_success();
             }
-            None => {
-                debug!("Unsupported or malformed data URI: {}", truncate_uri(url));
+            Err(e) => {
+                debug!(
+                    "Failed to load album art from {}: {}",
+                    truncate_uri(&url),
+                    e
+                );
                 on_failure();
             }
         }
+    });
+}
+
+/// Fetch the encoded image behind an MPRIS `artUrl`.
+async fn fetch_art_bytes(url: String) -> Result<glib::Bytes, String> {
+    if url.starts_with("file://") {
+        gio::File::for_uri(&url)
+            .load_bytes_future()
+            .await
+            .map(|(bytes, _etag)| bytes)
+            .map_err(|e| e.to_string())
+    } else if url.starts_with("http://") || url.starts_with("https://") {
+        // minreq is blocking, so spawn in thread pool
+        let fetch = |url: &str| {
+            minreq::get(url)
+                .with_timeout(10)
+                .send()
+                .ok()
+                .filter(|r| r.status_code >= 200 && r.status_code < 300)
+                .map(|r| r.into_bytes())
+        };
+        gio::spawn_blocking(move || {
+            fetch(&url).or_else(|| youtube_thumbnail_fallback_url(&url).and_then(|u| fetch(&u)))
+        })
+        .await
+        .ok()
+        .flatten()
+        .map(glib::Bytes::from_owned)
+        .ok_or_else(|| "fetch failed".to_string())
+    } else if url.starts_with("data:") {
+        // mpv-mpris emits embedded cover art as a base64 data URI.
+        decode_data_uri(&url)
+            .map(glib::Bytes::from_owned)
+            .ok_or_else(|| "unsupported or malformed data URI".to_string())
     } else {
-        warn!("Unknown album art URL scheme: {}", url);
-        on_failure();
+        Err("unknown URL scheme".to_string())
     }
 }
 
@@ -880,74 +845,6 @@ fn truncate_uri(url: &str) -> String {
             end -= 1;
         }
         format!("{}…({} bytes)", &url[..end], url.len())
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn load_texture_from_stream<S, F>(
-    stream: gio::InputStream,
-    picture: &RoundedPicture,
-    art_state: &Rc<RefCell<ArtState>>,
-    url: &str,
-    generation: u64,
-    cancellable: &gio::Cancellable,
-    on_success: S,
-    on_failure: F,
-) where
-    S: Fn() + 'static,
-    F: Fn() + 'static,
-{
-    let picture = picture.clone();
-    let art_state = art_state.clone();
-    let url = url.to_string();
-
-    Pixbuf::from_stream_async(&stream, Some(cancellable), move |result| {
-        if art_state.borrow().generation != generation {
-            return;
-        }
-        match result {
-            Ok(pixbuf) => {
-                picture.set_paintable(Some(&super::texture::texture_for_pixbuf(&pixbuf)));
-                picture.set_visible(true);
-                on_success();
-            }
-            Err(e) => {
-                if e.matches(gio::IOErrorEnum::Cancelled) {
-                    // Cancelled means a newer load superseded us — don't
-                    // call on_failure which would flash a fallback/placeholder.
-                    return;
-                }
-                debug!("Failed to decode album art from {}: {}", url, e);
-                on_failure();
-            }
-        }
-    });
-}
-
-fn load_texture_from_bytes<S, F>(
-    bytes: &[u8],
-    picture: &RoundedPicture,
-    url: &str,
-    on_success: &S,
-    on_failure: &F,
-) where
-    S: Fn(),
-    F: Fn(),
-{
-    let glib_bytes = glib::Bytes::from(bytes);
-    match Pixbuf::from_stream(
-        &gio::MemoryInputStream::from_bytes(&glib_bytes),
-        None::<&gio::Cancellable>,
-    ) {
-        Ok(pixbuf) => {
-            picture.set_paintable(Some(&super::texture::texture_for_pixbuf(&pixbuf)));
-            picture.set_visible(true);
-            on_success();
-        }
-        Err(e) => {
-            debug!("Failed to decode album art from {}: {}", url, e);
-            on_failure();
-        }
     }
 }
 
