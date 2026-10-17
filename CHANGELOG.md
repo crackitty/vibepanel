@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0](https://github.com/prankstr/vibepanel/compare/v0.16.1...v0.17.0) (2026-10-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* **deps:** vibepanel now requires GTK 4.22 or newer. Users on older GTK (for example Fedora 43, Debian 13 or Ubuntu 24.04) should stay on v0.16.x.
+
+### Features
+
+* **bar:** auto_hide ([#235](https://github.com/prankstr/vibepanel/issues/235)) ([b76d46a](https://github.com/prankstr/vibepanel/commit/b76d46abea5ec5bc5778567611ea77b8ca826c96))
+* **i18n:** add localization support and simplified Chinese ([#253](https://github.com/prankstr/vibepanel/issues/253)) ([403c07a](https://github.com/prankstr/vibepanel/commit/403c07ab00f3f672c6d01d1d5401c3f7131005e6))
+* **polkit:** add opt-in polkit authentication agent ([#238](https://github.com/prankstr/vibepanel/issues/238)) ([dd12cca](https://github.com/prankstr/vibepanel/commit/dd12ccac7383eff9ee4170b51c40c1f2404e8325))
+* **popover:** restyle text and password entries and use the accent color for their focus ring ([dd12cca](https://github.com/prankstr/vibepanel/commit/dd12ccac7383eff9ee4170b51c40c1f2404e8325))
+* **quick_settings:** add QR code sharing for active Wi-Fi networks ([#222](https://github.com/prankstr/vibepanel/issues/222)) ([67d31d2](https://github.com/prankstr/vibepanel/commit/67d31d24ac02f5303059914c4ed0d21c19498804))
+* **quick-settings:** animate Wi-Fi QR dialog open and close ([e597140](https://github.com/prankstr/vibepanel/commit/e59714035426e8fe08ade58c417af3329160843a))
+* **quicksettings:** refined network section headers ([#249](https://github.com/prankstr/vibepanel/issues/249)) ([1b58fa8](https://github.com/prankstr/vibepanel/commit/1b58fa84c94c705ef3de7a80b28f245a6136255a))
+* **system:** add drive usage to system popover and disk widget ([#234](https://github.com/prankstr/vibepanel/issues/234)) ([09803c1](https://github.com/prankstr/vibepanel/commit/09803c19a19bbeff134d85200e1dd5144b2af81b))
+* **updates:** add update_command option for custom upgrade scripts ([#254](https://github.com/prankstr/vibepanel/issues/254)) ([e88b232](https://github.com/prankstr/vibepanel/commit/e88b232b3308d9ca04c7f3363f458b08fed3cb64))
+* **window-title:** add filter_by_output to show the focused window on every bar ([#247](https://github.com/prankstr/vibepanel/issues/247)) ([2fe6cec](https://github.com/prankstr/vibepanel/commit/2fe6cecd445cdfb2adc39278cf5674c6a6a039fd))
+* **workspace:** scroll to change workspace when hovering widget([#226](https://github.com/prankstr/vibepanel/issues/226)) ([1528cf8](https://github.com/prankstr/vibepanel/commit/1528cf8e0a5cf9a91bc3716775737c761c70360a))
+
+
+### Bug Fixes
+
+* **bar:** pin smart bar and reserve space in mango overview and special tag ([#236](https://github.com/prankstr/vibepanel/issues/236)) ([b55efd8](https://github.com/prankstr/vibepanel/commit/b55efd8bf0dccc3bf70c9ac96019fd4f262644bb))
+* **blur:** use GTK's native blur on GTK &gt;= 4.23.3 ([#245](https://github.com/prankstr/vibepanel/issues/245)) ([405cae4](https://github.com/prankstr/vibepanel/commit/405cae4bf0bb0cf74d60bc40bb225509189734d3))
+* **hyprland:** switch keyboard layout on the current keyboard instead of all ([29a1eaf](https://github.com/prankstr/vibepanel/commit/29a1eaf2a0443fc94d72da19dabc1d10a079c354))
+* **mango/taskbar:** filter special tag clients ([#229](https://github.com/prankstr/vibepanel/issues/229)) ([14d8283](https://github.com/prankstr/vibepanel/commit/14d82833ae41419ce83c9400b13f9254e0cc810a))
+* **network:** don't delete known wifi profiles on failed connection attempt ([#220](https://github.com/prankstr/vibepanel/issues/220)) ([2c1f77b](https://github.com/prankstr/vibepanel/commit/2c1f77b3a59781dce4ec383227ccf05366722611))
+* **network:** fix crash and restore Wi-Fi/VPN after NetworkManager restart ([#232](https://github.com/prankstr/vibepanel/issues/232)) ([386c059](https://github.com/prankstr/vibepanel/commit/386c059093e667def325dbf551a3175e68e0b069))
+* **niri:** keep the window title while a popover or launcher has focus ([2fe6cec](https://github.com/prankstr/vibepanel/commit/2fe6cecd445cdfb2adc39278cf5674c6a6a039fd))
+* **nix:** provide session bus config for integration tests ([#233](https://github.com/prankstr/vibepanel/issues/233)) ([3656b2a](https://github.com/prankstr/vibepanel/commit/3656b2ab0127b9eb532ab0f8804eebc4a56c00dc)), closes [#230](https://github.com/prankstr/vibepanel/issues/230)
+* **notifications:** advertise x-kde-origin-name to avoid site data in message ([#240](https://github.com/prankstr/vibepanel/issues/240)) ([e68b602](https://github.com/prankstr/vibepanel/commit/e68b6026f6bc2a6cfe00ebe4ee6329831e0a2d2a))
+* **notifications:** use foreground color for dismiss buttons ([#225](https://github.com/prankstr/vibepanel/issues/225)) ([3aa9e7a](https://github.com/prankstr/vibepanel/commit/3aa9e7a2864b0a138641223b7add3eef756cf7bc))
+* **popover:** finish close animation once content is barely visible so compositor layer blur no longer lingers ([e597140](https://github.com/prankstr/vibepanel/commit/e59714035426e8fe08ade58c417af3329160843a))
+* **popover:** keep popover drop shadow when a control inside it has focus ([e597140](https://github.com/prankstr/vibepanel/commit/e59714035426e8fe08ade58c417af3329160843a))
+* **popover:** make the click-catcher fully transparent ([#248](https://github.com/prankstr/vibepanel/issues/248)) ([66fb4e2](https://github.com/prankstr/vibepanel/commit/66fb4e237bb45d6390faa723923b31f3d785a4fe))
+* **popover:** open IPC-toggled popovers on the focused monitor on Hyprland ([#246](https://github.com/prankstr/vibepanel/issues/246)) ([29a1eaf](https://github.com/prankstr/vibepanel/commit/29a1eaf2a0443fc94d72da19dabc1d10a079c354))
+* **popover:** reopen a popover that was hidden while already hidden ([e597140](https://github.com/prankstr/vibepanel/commit/e59714035426e8fe08ade58c417af3329160843a))
+* **quicksettings:** clip hold progress animation to rounded corners ([#255](https://github.com/prankstr/vibepanel/issues/255)) ([b326ea4](https://github.com/prankstr/vibepanel/commit/b326ea43ef529e76e264956650e53df6b5670fec))
+* **sway:** only clear the title on the focused bar when switching to an empty workspace ([2fe6cec](https://github.com/prankstr/vibepanel/commit/2fe6cecd445cdfb2adc39278cf5674c6a6a039fd))
+* **vpn:** ignore stale auth-dialog results in secret agent ([#257](https://github.com/prankstr/vibepanel/issues/257)) ([c99900e](https://github.com/prankstr/vibepanel/commit/c99900ecd71dfff9a6a6661c37d937ec14cc57e7))
+* **window_title:** bars now show their output's window right away instead of starting blank ([2fe6cec](https://github.com/prankstr/vibepanel/commit/2fe6cecd445cdfb2adc39278cf5674c6a6a039fd))
+* **window-title:** follow each monitor's own windows on Hyprland ([29a1eaf](https://github.com/prankstr/vibepanel/commit/29a1eaf2a0443fc94d72da19dabc1d10a079c354))
+
+
+### Miscellaneous
+
+* **deps:** require GTK 4.22 and update gtk4-rs to 0.11 ([#244](https://github.com/prankstr/vibepanel/issues/244)) ([37208c8](https://github.com/prankstr/vibepanel/commit/37208c847e8aca834426bf029fc0bb223efd44d6))
+
 ## [0.16.1](https://github.com/prankstr/vibepanel/compare/v0.16.0...v0.16.1) (2026-08-27)
 
 
