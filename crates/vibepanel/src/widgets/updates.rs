@@ -13,6 +13,7 @@
 
 use gtk4::prelude::*;
 use gtk4::{GestureClick, Label};
+use tr::tr;
 use vibepanel_core::config::WidgetEntry;
 
 use crate::services::callbacks::CallbackId;
@@ -73,7 +74,7 @@ impl UpdatesWidget {
     /// Create a new updates widget with the given configuration.
     pub fn new(config: UpdatesConfig) -> Self {
         let base = BaseWidget::new(&[widget::UPDATES]);
-        base.set_tooltip("Updates: checking...");
+        base.set_tooltip(&tr!("Updates: checking..."));
 
         // Mark as clickable since we have a custom click handler
         base.widget().add_css_class(state::CLICKABLE);

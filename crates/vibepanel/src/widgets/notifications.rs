@@ -17,6 +17,7 @@ use gtk4::{Align, Application, Box as GtkBox, Orientation, Overlay, Widget};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use tr::tr;
 use tracing::{debug, warn};
 use vibepanel_core::config::WidgetEntry;
 
@@ -124,7 +125,7 @@ impl NotificationsWidgetInner {
             self.icon_handle.add_css_class(widget::BACKEND_UNAVAILABLE);
             tooltip_manager.set_styled_tooltip(
                 &self.container,
-                "Notification daemon unavailable (another daemon is running)",
+                &tr!("Notification daemon unavailable (another daemon is running)"),
             );
         } else {
             self.icon_handle
@@ -140,19 +141,17 @@ impl NotificationsWidgetInner {
             if count > 0 {
                 // Show unread count in tooltip (badge is just a dot)
                 let tooltip = if unread > 0 {
-                    if unread == 1 {
-                        format!("1 new notification ({} total)", count)
-                    } else {
-                        format!("{} new notifications ({} total)", unread, count)
-                    }
-                } else if count == 1 {
-                    "1 notification".to_string()
+                    tr!(
+                        "{n} new notification ({count} total)"
+                            | "{n} new notifications ({count} total)" % unread,
+                        count
+                    )
                 } else {
-                    format!("{} notifications", count)
+                    tr!("{n} notification" | "{n} notifications" % count)
                 };
                 tooltip_manager.set_styled_tooltip(&self.container, &tooltip);
             } else {
-                tooltip_manager.set_styled_tooltip(&self.container, "No notifications");
+                tooltip_manager.set_styled_tooltip(&self.container, &tr!("No notifications"));
             }
         }
 
@@ -337,7 +336,7 @@ impl NotificationsWidget {
 
         base.content().append(&overlay);
 
-        base.set_tooltip("Notifications");
+        base.set_tooltip(&tr!("Notifications"));
 
         let inner = Rc::new(NotificationsWidgetInner {
             icon_handle,

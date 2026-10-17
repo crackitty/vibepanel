@@ -46,6 +46,7 @@ use gtk4::{
     EventControllerScrollFlags, GestureClick, Label, Overlay, Widget,
 };
 use gtk4_layer_shell::{KeyboardMode, LayerShell};
+use tr::tr;
 use tracing::{debug, trace, warn};
 use vibepanel_core::config::WidgetEntry;
 
@@ -1421,26 +1422,29 @@ fn build_tooltip(workspace: &Workspace) -> String {
     // show the name without an index prefix.
     let idx_str = workspace.idx.to_string();
     if workspace.idx < 0 {
-        parts.push(format!("Workspace {}", workspace.name));
+        parts.push(tr!("Workspace {name}", name = workspace.name));
     } else if workspace.name != idx_str {
-        parts.push(format!("Workspace {}: {}", workspace.idx, workspace.name));
+        parts.push(tr!(
+            "Workspace {idx}: {name}",
+            idx = workspace.idx,
+            name = workspace.name
+        ));
     } else {
-        parts.push(format!("Workspace {}", workspace.name));
+        parts.push(tr!("Workspace {name}", name = workspace.name));
     }
 
     if workspace.active {
-        parts.push("Active".to_string());
+        parts.push(tr!("workspace" => "Active"));
     } else if workspace.urgent {
-        parts.push("Urgent".to_string());
+        parts.push(tr!("Urgent"));
     }
 
     if let Some(count) = workspace.window_count {
-        let windows_str = if count == 1 { "window" } else { "windows" };
-        parts.push(format!("{} {}", count, windows_str));
+        parts.push(tr!("{n} window" | "{n} windows" % count));
     } else if workspace.occupied {
-        parts.push("Has windows".to_string());
+        parts.push(tr!("Has windows"));
     } else {
-        parts.push("Empty".to_string());
+        parts.push(tr!("workspace" => "Empty"));
     }
 
     parts.join(" • ")

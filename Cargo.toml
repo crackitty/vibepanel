@@ -72,3 +72,7 @@ qrcode = { version = "0.14", default-features = false }
 
 # Internal crates
 vibepanel-core = { path = "crates/vibepanel-core" }
+
+# i18n
+tr = "0.1.11"
+gettext-rs = { version = "0.7", features = ["gettext-system"] }

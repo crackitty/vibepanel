@@ -6,6 +6,7 @@
 use gtk4::Label;
 use gtk4::prelude::*;
 use std::time::{Duration, SystemTime};
+use tr::tr;
 use vibepanel_core::config::{WeatherUnits, WeatherWindUnits, WidgetEntry};
 
 use crate::services::callbacks::CallbackId;
@@ -77,7 +78,7 @@ impl WeatherWidget {
     }
 
     fn build(config: WeatherConfig, base: BaseWidget, create_popover: bool) -> Self {
-        base.set_tooltip("Weather: loading...");
+        base.set_tooltip(&tr!("Weather: loading..."));
 
         let icon_handle = base.add_icon("weather-unknown", &[widget::WEATHER_ICON]);
         let label = base.add_label(None, &[widget::WEATHER_LABEL, class::VCENTER_CAPS]);
@@ -231,56 +232,61 @@ fn format_label(snapshot: &WeatherSnapshot, format: &str, is_vertical: bool) -> 
 
 fn format_tooltip(snapshot: &WeatherSnapshot) -> String {
     let mut lines = Vec::new();
+    let unknown_location = tr!("Unknown location");
     let location = snapshot
         .location
         .as_ref()
         .map(|location| location.name.as_str())
-        .unwrap_or("Unknown location");
+        .unwrap_or(&unknown_location);
 
     if let Some(current) = &snapshot.current {
-        lines.push(format!(
-            "Weather: {} · {}",
+        lines.push(tr!(
+            "Weather: {location} · {temperature}",
             location,
-            format_temperature(current.temperature, snapshot.units, false)
+            temperature = format_temperature(current.temperature, snapshot.units, false)
         ));
-        lines.push(format!("Condition: {}", current.condition));
+        lines.push(tr!("Condition: {condition}", condition = current.condition));
         if let Some(feels_like) = current.feels_like {
-            lines.push(format!(
-                "Feels like: {}",
-                format_temperature(feels_like, snapshot.units, false)
+            lines.push(tr!(
+                "Feels like: {temperature}",
+                temperature = format_temperature(feels_like, snapshot.units, false)
             ));
         }
         if let Some(humidity) = current.humidity {
-            lines.push(format!("Humidity: {humidity}%"));
+            lines.push(tr!("Humidity: {humidity}%", humidity));
         }
         if current.wind_speed.is_some() {
-            lines.push(format!(
-                "Wind: {}",
-                format_wind(current.wind_speed, snapshot.wind_units)
+            lines.push(tr!(
+                "Wind: {wind}",
+                wind = format_wind(current.wind_speed, snapshot.wind_units)
             ));
         }
         if let Some(is_day) = current.is_day {
-            lines.push(format!("Light: {}", if is_day { "day" } else { "night" }));
+            let light = if is_day { tr!("day") } else { tr!("night") };
+            lines.push(tr!("Light: {light}", light));
         }
 
         if let Some(forecast) = snapshot.daily.first() {
             lines.push(format_daily_forecast(forecast, snapshot.units));
         }
     } else if snapshot.loading {
-        lines.push("Weather: loading...".to_string());
+        lines.push(tr!("Weather: loading..."));
     } else {
-        lines.push("Weather: unavailable".to_string());
+        lines.push(tr!("Weather: unavailable"));
     }
 
     if let Some(last_update) = snapshot.last_update {
-        lines.push(format!("Updated: {}", format_last_update(last_update)));
+        lines.push(tr!(
+            "Updated: {last_update}",
+            last_update = format_last_update(last_update)
+        ));
     }
 
     if snapshot.stale {
-        lines.push("Data may be stale".to_string());
+        lines.push(tr!("Data may be stale"));
     }
     if let Some(error) = &snapshot.error {
-        lines.push(format!("Error: {error}"));
+        lines.push(tr!("Error: {error}", error));
     }
 
     lines.join("\n")
@@ -298,23 +304,35 @@ fn format_daily_forecast(
         .temperature_max
         .map(|value| format_temperature(value, units, false))
         .unwrap_or_else(|| "—".to_string());
-    let precip = forecast
-        .precipitation_probability
-        .map(|value| format!(", rain {value}%"))
-        .unwrap_or_default();
-
-    format!(
-        "Forecast {}: {}, {} / {}{}",
-        forecast.date, forecast.condition, low, high, precip
-    )
+    let date = &forecast.date;
+    let condition = &forecast.condition;
+    match forecast.precipitation_probability {
+        Some(rain) => tr!(
+            "Forecast {date}: {condition}, {low} / {high}, rain {rain}%",
+            date,
+            condition,
+            low,
+            high,
+            rain
+        ),
+        None => tr!(
+            "Forecast {date}: {condition}, {low} / {high}",
+            date,
+            condition,
+            low,
+            high
+        ),
+    }
 }
 
 fn format_last_update(last_update: SystemTime) -> String {
     match SystemTime::now().duration_since(last_update) {
-        Ok(age) if age < Duration::from_secs(60) => "just now".to_string(),
-        Ok(age) if age < Duration::from_secs(60 * 60) => format!("{}m ago", age.as_secs() / 60),
-        Ok(age) => format!("{}h ago", age.as_secs() / (60 * 60)),
-        Err(_) => "just now".to_string(),
+        Ok(age) if age < Duration::from_secs(60) => tr!("just now"),
+        Ok(age) if age < Duration::from_secs(60 * 60) => {
+            tr!("{minutes}m ago", minutes = (age.as_secs() / 60))
+        }
+        Ok(age) => tr!("{hours}h ago", hours = (age.as_secs() / (60 * 60))),
+        Err(_) => tr!("just now"),
     }
 }
 

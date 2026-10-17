@@ -5,6 +5,7 @@
 
 use gtk4::Label;
 use gtk4::prelude::*;
+use tr::tr;
 use vibepanel_core::config::WidgetEntry;
 use vibepanel_core::expand_tilde;
 
@@ -210,13 +211,16 @@ fn update_disk_widget(
         Some(Some(usage)) => usage,
         pending_or_failed => {
             let (text, status) = match pending_or_failed {
-                None => ("--", "loading"),
-                _ => ("?", "unavailable"),
+                None => ("--", tr!("loading")),
+                _ => ("?", tr!("unavailable")),
             };
             label.set_label(text);
             container.remove_css_class(widget::DISK_HIGH);
             icon_handle.remove_css_class(widget::DISK_HIGH);
-            tooltips.set_styled_tooltip(container, &format!("Disk {}: {status}", config.path));
+            tooltips.set_styled_tooltip(
+                container,
+                &tr!("Disk {path}: {status}", path = config.path, status),
+            );
             return;
         }
     };
@@ -237,13 +241,13 @@ fn update_disk_widget(
     label.set_label(&format_disk(usage, &config.format, is_vertical));
     tooltips.set_styled_tooltip(
         container,
-        &format!(
-            "Disk {}: {:.1}%\n{} / {}\n{} free",
-            config.path,
-            usage.percent(),
-            format_bytes_long(usage.used),
-            format_bytes_long(usage.total),
-            format_bytes_long(usage.available)
+        &tr!(
+            "Disk {path}: {percent}%\n{used} / {total}\n{free} free",
+            path = config.path,
+            percent = format!("{:.1}", usage.percent()),
+            used = format_bytes_long(usage.used),
+            total = format_bytes_long(usage.total),
+            free = format_bytes_long(usage.available)
         ),
     );
 }

@@ -11,6 +11,7 @@
 
 use gtk4::Label;
 use gtk4::prelude::*;
+use tr::tr;
 use vibepanel_core::config::WidgetEntry;
 
 use crate::services::battery::{
@@ -103,7 +104,7 @@ impl BatteryWidget {
         let base = BaseWidget::new(&[widget::BATTERY]);
 
         // Initial tooltip until the first snapshot arrives.
-        base.set_tooltip("Battery: unknown");
+        base.set_tooltip(&tr!("Battery: unknown"));
 
         // Create icon via BaseWidget/IconsService for themed rendering
         let icon_handle = base.add_icon("battery-missing", &[widget::BATTERY_ICON]);
@@ -251,7 +252,7 @@ fn update_widgets_from_state_impl(
         }
 
         let tooltip_manager = TooltipManager::global();
-        tooltip_manager.set_styled_tooltip(container, "Battery: Service unavailable");
+        tooltip_manager.set_styled_tooltip(container, &tr!("Battery: Service unavailable"));
         return;
     }
     container.remove_css_class(state::SERVICE_UNAVAILABLE);
@@ -302,24 +303,25 @@ fn update_widgets_from_state_impl(
     // Build tooltip text with battery percentage and state.
     // Use TooltipManager for styled tooltips.
     let tooltip = match (percent, state) {
-        (None, _) => "Battery: unknown".to_string(),
+        (None, _) => tr!("Battery: unknown"),
         (Some(p), Some(s)) => {
             let pct = rounded_pct_value(p);
-            let mut text = format!("Battery: {}", readable_pct(pct));
             let state_text = if s == STATE_CHARGING {
-                "Charging"
+                tr!("Charging")
             } else if s == STATE_FULLY_CHARGED {
-                "Full"
+                tr!("battery state" => "Full")
             } else {
-                "Discharging"
+                tr!("Discharging")
             };
-            text.push_str("\nState: ");
-            text.push_str(state_text);
-            text
+            tr!(
+                "Battery: {pct}\nState: {state}",
+                pct = readable_pct(pct),
+                state = state_text
+            )
         }
         (Some(p), None) => {
             let pct = rounded_pct_value(p);
-            format!("Battery: {}", readable_pct(pct))
+            tr!("Battery: {pct}", pct = readable_pct(pct))
         }
     };
 

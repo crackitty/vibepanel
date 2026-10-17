@@ -3,6 +3,7 @@
 //! This is the main entry point for the vibepanel bar application.
 
 mod bar;
+mod i18n;
 pub mod layout_math;
 pub mod popover_registry;
 pub mod popover_tracker;
@@ -242,6 +243,10 @@ fn main() -> ExitCode {
     // fall back safely if unrelated config is broken.
     if let Some(command) = args.command.take() {
         return handle_command(command, args.config.as_deref());
+    }
+
+    if let Err(e) = i18n::init() {
+        warn!("Failed to set up translations, using English: {e}");
     }
 
     // Load configuration using XDG lookup chain

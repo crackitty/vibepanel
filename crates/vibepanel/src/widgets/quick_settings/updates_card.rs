@@ -12,6 +12,7 @@ use std::rc::Rc;
 use gtk4::pango::{EllipsizeMode, WrapMode};
 use gtk4::prelude::*;
 use gtk4::{Box as GtkBox, Button, Label, Orientation, PolicyType, Revealer, ScrolledWindow};
+use tr::tr;
 use tracing::debug;
 
 use super::components::ToggleCard;
@@ -76,7 +77,7 @@ pub fn build_updates_card(
 
     let card = ToggleCard::builder()
         .icon(icon_name)
-        .label("Updates")
+        .label(&tr!("Updates"))
         .subtitle(&subtitle_text)
         .active(has_updates)
         .sensitive(snapshot.available)
@@ -154,7 +155,7 @@ pub fn build_updates_details(state: &Rc<UpdatesCardState>) -> UpdatesDetailsResu
     *state.last_check_label.borrow_mut() = Some(last_check_label);
 
     // Refresh button (right side, matching wifi/bluetooth scan button position)
-    let refresh_btn = ScanButton::new("Refresh", || {
+    let refresh_btn = ScanButton::new(&tr!("Refresh"), || {
         debug!("Updates: refresh button clicked");
         UpdatesService::global().refresh();
     });
@@ -225,7 +226,10 @@ pub fn on_updates_changed(state: &UpdatesCardState, snapshot: &UpdatesSnapshot) 
         let text = if let Some(ref status) = snapshot.check_status {
             status.clone()
         } else {
-            format!("Last check: {}", format_last_check(snapshot.last_check))
+            tr!(
+                "Last check: {last_check}",
+                last_check = format_last_check(snapshot.last_check)
+            )
         };
         label.set_label(&text);
     }
@@ -256,7 +260,7 @@ fn populate_updates_list(state: &UpdatesCardState, snapshot: &UpdatesSnapshot) {
 
     // Handle error state
     if let Some(ref error) = snapshot.error {
-        let row = create_message_row(&format!("Error: {}", error));
+        let row = create_message_row(&tr!("Error: {error}", error));
         row.add_css_class(qs::UPDATES_ERROR);
         list_box.append(&row);
         return;
@@ -265,7 +269,7 @@ fn populate_updates_list(state: &UpdatesCardState, snapshot: &UpdatesSnapshot) {
     // Handle no updates (don't show "up to date" while still checking)
     if snapshot.update_count == 0 {
         if !snapshot.checking {
-            let row = create_message_row("System is up to date");
+            let row = create_message_row(&tr!("System is up to date"));
             list_box.append(&row);
         }
         return;

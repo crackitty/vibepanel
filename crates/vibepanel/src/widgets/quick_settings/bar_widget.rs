@@ -8,6 +8,7 @@ use gtk4::gdk::BUTTON_PRIMARY;
 use gtk4::prelude::*;
 use gtk4::{Box as GtkBox, GestureClick};
 use std::rc::Rc;
+use tr::tr;
 use tracing::{debug, warn};
 
 use super::QuickSettingsWindowHandle;
@@ -265,7 +266,7 @@ impl QuickSettingsWidget {
                         widget.add_css_class(state::SERVICE_UNAVAILABLE);
                         audio_icon_handle.set_icon("audio-volume-muted-symbolic");
                         TooltipManager::global()
-                            .set_styled_tooltip(&widget, "Audio: Service unavailable");
+                            .set_styled_tooltip(&widget, &tr!("Audio: Service unavailable"));
                         return;
                     }
 
@@ -274,7 +275,7 @@ impl QuickSettingsWidget {
                         widget.add_css_class(state::SERVICE_UNAVAILABLE);
                         audio_icon_handle.set_icon("audio-volume-muted-symbolic");
                         TooltipManager::global()
-                            .set_styled_tooltip(&widget, "Volume control unavailable");
+                            .set_styled_tooltip(&widget, &tr!("Volume control unavailable"));
                         return;
                     }
 
@@ -284,9 +285,9 @@ impl QuickSettingsWidget {
                     audio_icon_handle.set_icon(icon_name);
 
                     let tooltip = if snapshot.muted {
-                        "Muted".to_string()
+                        tr!("Muted")
                     } else {
-                        format!("Volume: {}%", snapshot.volume)
+                        tr!("Volume: {volume}%", volume = snapshot.volume)
                     };
                     TooltipManager::global().set_styled_tooltip(&widget, &tooltip);
                 },
@@ -325,7 +326,7 @@ impl QuickSettingsWidget {
                         widget.remove_css_class(state::ICON_ACTIVE);
                         bt_icon_handle.set_icon("bluetooth-disabled-symbolic");
                         TooltipManager::global()
-                            .set_styled_tooltip(&widget, "Bluetooth: No adapter found");
+                            .set_styled_tooltip(&widget, &tr!("Bluetooth: No adapter found"));
                         return;
                     }
 
@@ -358,13 +359,13 @@ impl QuickSettingsWidget {
                             .map(|d| d.name.clone())
                             .collect();
                         if lines.is_empty() {
-                            lines.push("Bluetooth On".to_string());
+                            lines.push(tr!("Bluetooth On"));
                         }
                         lines.join("\n")
                     } else if powered {
-                        "Bluetooth On".to_string()
+                        tr!("Bluetooth On")
                     } else {
-                        "Bluetooth Off".to_string()
+                        tr!("Bluetooth Off")
                     };
                     TooltipManager::global().set_styled_tooltip(&widget, &tooltip);
                 },
@@ -407,7 +408,7 @@ impl QuickSettingsWidget {
                         wifi_icon_handle.set_spinning(false);
                         wifi_icon_handle.set_icon("network-wireless-offline-symbolic");
                         TooltipManager::global()
-                            .set_styled_tooltip(&widget, "Wi-Fi: Service unavailable");
+                            .set_styled_tooltip(&widget, &tr!("Wi-Fi: Service unavailable"));
                         return;
                     }
                     widget.remove_css_class(state::SERVICE_UNAVAILABLE);
@@ -435,25 +436,26 @@ impl QuickSettingsWidget {
                     }
 
                     let tooltip = if snapshot.wired_connected() {
-                        "Ethernet connected".to_string()
+                        tr!("Ethernet connected")
                     } else if snapshot.connected() {
-                        let ssid = snapshot.active_ssid().unwrap_or("Connected");
+                        let connected_label = tr!("Connected");
+                        let ssid = snapshot.active_ssid().unwrap_or(&connected_label);
                         let strength = snapshot.active_strength();
                         if strength > 0 {
-                            format!("{}\nSignal: {}%", ssid, strength)
+                            tr!("{ssid}\nSignal: {strength}%", ssid, strength)
                         } else {
                             ssid.to_string()
                         }
                     } else if let Some(ssid) = snapshot.connecting_ssid() {
-                        format!("Connecting to {}", ssid)
+                        tr!("Connecting to {ssid}", ssid)
                     } else if snapshot.wifi_device_connecting() {
-                        "Connecting...".to_string()
+                        tr!("Connecting...")
                     } else if snapshot.wifi_enabled() == Some(false) {
-                        "Wi-Fi Off".to_string()
+                        tr!("Wi-Fi Off")
                     } else if snapshot.scanning() {
-                        "Wi-Fi: Scanning...".to_string()
+                        tr!("Wi-Fi: Scanning...")
                     } else {
-                        "Disconnected".to_string()
+                        tr!("Disconnected")
                     };
                     TooltipManager::global().set_styled_tooltip(&widget, &tooltip);
                 },
@@ -515,19 +517,24 @@ impl QuickSettingsWidget {
 
                     let carrier = snapshot.mobile_display_name().to_string();
                     let tooltip = if !mobile_enabled {
-                        format!("{}\nOff", carrier)
+                        tr!("{carrier}\nOff", carrier)
                     } else if snapshot.mobile_connecting() {
-                        format!("{}\nConnecting...", carrier)
+                        tr!("{carrier}\nConnecting...", carrier)
                     } else if snapshot.mobile_failed() {
-                        format!("{}\nConnection failed", carrier)
+                        tr!("{carrier}\nConnection failed", carrier)
                     } else if snapshot.mobile_active() {
                         if let Some(tech) = snapshot.mobile_access_technology() {
-                            format!("{}\nSignal: {}%\n{}", carrier, quality, tech)
+                            tr!(
+                                "{carrier}\nSignal: {quality}%\n{tech}",
+                                carrier,
+                                quality,
+                                tech
+                            )
                         } else {
-                            format!("{}\nSignal: {}%", carrier, quality)
+                            tr!("{carrier}\nSignal: {quality}%", carrier, quality)
                         }
                     } else {
-                        format!("{}\nDisconnected", carrier)
+                        tr!("{carrier}\nDisconnected", carrier)
                     };
                     TooltipManager::global().set_styled_tooltip(&widget, &tooltip);
                 },
@@ -575,12 +582,12 @@ impl QuickSettingsWidget {
                         .map(|c| c.name.clone())
                         .collect();
                     if active_names.is_empty() {
-                        "VPN Connected".to_string()
+                        tr!("VPN Connected")
                     } else {
                         active_names.join("\n")
                     }
                 } else {
-                    "VPN Disconnected".to_string()
+                    tr!("VPN Disconnected")
                 };
                 TooltipManager::global().set_styled_tooltip(&widget, &tooltip);
             }));

@@ -11,6 +11,7 @@
 
 use gtk4::Label;
 use gtk4::prelude::*;
+use tr::tr;
 use vibepanel_core::config::WidgetEntry;
 
 use crate::services::callbacks::CallbackId;
@@ -131,7 +132,7 @@ impl MemoryWidget {
 
     /// Shared construction for active and passive modes.
     fn build(config: MemoryConfig, base: BaseWidget) -> Self {
-        base.set_tooltip("Memory: unknown");
+        base.set_tooltip(&tr!("Memory: unknown"));
 
         let icon_handle = base.add_icon("ram-symbolic", &[widget::MEMORY_ICON]);
 
@@ -232,7 +233,7 @@ fn update_memory_widget(
         memory_label.set_visible(true);
 
         let tooltip_manager = TooltipManager::global();
-        tooltip_manager.set_styled_tooltip(container, "Memory: Service unavailable");
+        tooltip_manager.set_styled_tooltip(container, &tr!("Memory: Service unavailable"));
         return;
     }
 
@@ -254,11 +255,11 @@ fn update_memory_widget(
     memory_label.set_label(&text);
     memory_label.set_visible(true);
 
-    let tooltip = format!(
-        "Memory: {:.1}%\n{} / {}",
-        snapshot.memory_percent,
-        format_bytes_long(snapshot.memory_used),
-        format_bytes_long(snapshot.memory_total)
+    let tooltip = tr!(
+        "Memory: {memory_percent}%\n{used} / {total}",
+        memory_percent = format!("{:.1}", snapshot.memory_percent),
+        used = format_bytes_long(snapshot.memory_used),
+        total = format_bytes_long(snapshot.memory_total)
     );
     let tooltip_manager = TooltipManager::global();
     tooltip_manager.set_styled_tooltip(container, &tooltip);

@@ -7,6 +7,7 @@ use std::cell::RefCell;
 
 use gtk4::prelude::*;
 use gtk4::{Label, ToggleButton};
+use tr::tr;
 
 use crate::services::icons::IconHandle;
 use crate::services::idle_inhibitor::IdleInhibitorSnapshot;
@@ -57,11 +58,11 @@ pub fn on_idle_inhibitor_changed(state: &IdleInhibitorCardState, snapshot: &Idle
     // Update subtitle
     if let Some(label) = state.subtitle.borrow().as_ref() {
         let subtitle = if snapshot.active {
-            "Enabled"
+            tr!("Enabled")
         } else {
-            "Disabled"
+            tr!("Disabled")
         };
-        label.set_label(subtitle);
+        label.set_label(&subtitle);
         set_subtitle_active(label, snapshot.active);
     }
 }

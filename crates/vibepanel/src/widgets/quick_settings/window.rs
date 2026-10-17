@@ -16,6 +16,7 @@ use gtk4::{
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
+use tr::tr;
 
 use crate::popover_tracker::{PopoverId, PopoverTracker};
 use crate::services::audio::AudioService;
@@ -591,10 +592,10 @@ impl QuickSettingsWindow {
                         expandable: Some(state as Rc<dyn ExpandableCard>),
                         on_toggle: Some(Rc::new(move |expanding| {
                             if let Some(ref subtitle) = *state_clone.base.subtitle.borrow() {
-                                subtitle.set_label(if expanding {
-                                    "Hold to confirm"
+                                subtitle.set_label(&if expanding {
+                                    tr!("Hold to confirm")
                                 } else {
-                                    "Hold to shut down"
+                                    tr!("Hold to shut down")
                                 });
                             }
                         })),
@@ -664,14 +665,14 @@ impl QuickSettingsWindow {
 
         // Card title: "Network" if ethernet/modem device exists, "Wi-Fi" otherwise
         let card_title = if snapshot.has_non_wifi_device() {
-            "Network"
+            tr!("Network")
         } else {
-            "Wi-Fi"
+            tr!("Wi-Fi")
         };
 
         let network_card = ToggleCard::builder()
             .icon(icon_name)
-            .label(card_title)
+            .label(&card_title)
             .subtitle_widget(subtitle_result.container.upcast())
             .active(wifi_enabled)
             .sensitive(true)
@@ -772,9 +773,9 @@ impl QuickSettingsWindow {
         let bt_connected = bt_snapshot.connected_devices;
 
         let bt_subtitle_text = if !bt_has_adapter {
-            "Unavailable".to_string()
+            tr!("Unavailable")
         } else if !bt_snapshot.is_ready {
-            "Bluetooth".to_string()
+            tr!("Bluetooth")
         } else if bt_connected > 0 {
             if bt_connected == 1 {
                 bt_snapshot
@@ -782,14 +783,14 @@ impl QuickSettingsWindow {
                     .iter()
                     .find(|d| d.connected)
                     .map(|d| d.name.clone())
-                    .unwrap_or_else(|| "Bluetooth".to_string())
+                    .unwrap_or_else(|| tr!("Bluetooth"))
             } else {
-                format!("{} connected", bt_connected)
+                tr!("{count} connected", count = bt_connected)
             }
         } else if bt_powered {
-            "Enabled".to_string()
+            tr!("Enabled")
         } else {
-            "Disabled".to_string()
+            tr!("Disabled")
         };
 
         let bt_icon_name = bt_icon_name(bt_powered, bt_connected);
@@ -797,7 +798,7 @@ impl QuickSettingsWindow {
 
         let bt_card = ToggleCard::builder()
             .icon(bt_icon_name)
-            .label("Bluetooth")
+            .label(&tr!("Bluetooth"))
             .subtitle(&bt_subtitle_text)
             .active(bt_powered && bt_has_adapter)
             .sensitive(bt_has_adapter)
@@ -859,15 +860,15 @@ impl QuickSettingsWindow {
         let vpn_any_active = vpn_snapshot.any_active;
 
         let vpn_subtitle_text = if !vpn_snapshot.is_ready {
-            "VPN".to_string()
+            tr!("VPN")
         } else if let Some(p) = vpn_primary {
             if p.active {
                 p.name.clone()
             } else {
-                "Disconnected".to_string()
+                tr!("Disconnected")
             }
         } else {
-            "No connections".to_string()
+            tr!("No connections")
         };
 
         let vpn_icon = vpn_icon_name();
@@ -875,7 +876,7 @@ impl QuickSettingsWindow {
 
         let vpn_card = ToggleCard::builder()
             .icon(vpn_icon)
-            .label("VPN")
+            .label(&tr!("VPN"))
             .subtitle(&vpn_subtitle_text)
             .active(vpn_primary.map(|p| p.active).unwrap_or(false))
             .sensitive(vpn_has_connections)
@@ -936,14 +937,14 @@ impl QuickSettingsWindow {
         let idle_available = idle_snapshot.available;
 
         let idle_subtitle_text = if idle_active {
-            "Enabled".to_string()
+            tr!("Enabled")
         } else {
-            "Disabled".to_string()
+            tr!("Disabled")
         };
 
         let idle_card = ToggleCard::builder()
             .icon("night-light-symbolic")
-            .label("Idle Inhibitor")
+            .label(&tr!("Idle Inhibitor"))
             .subtitle(&idle_subtitle_text)
             .active(idle_active)
             .sensitive(idle_available)
@@ -1300,7 +1301,7 @@ impl QuickSettingsWindow {
         if let Some(ref power_state) = *self.power.borrow() {
             collapse(&power_state.base);
             if let Some(ref subtitle) = *power_state.base.subtitle.borrow() {
-                subtitle.set_label("Hold to shut down");
+                subtitle.set_label(&tr!("Hold to shut down"));
             }
         }
 

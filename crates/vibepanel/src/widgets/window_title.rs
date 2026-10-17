@@ -12,6 +12,7 @@ use std::rc::Rc;
 
 use gtk4::prelude::*;
 use gtk4::{Align, Box as GtkBox, CenterBox, Image, Label, Orientation};
+use tr::tr;
 use tracing::{debug, trace};
 use vibepanel_core::config::WidgetEntry;
 
@@ -672,16 +673,16 @@ fn update_tooltip(
         } else {
             &snapshot.app_id
         };
-        lines.push(format!("App: {}", app_label));
+        lines.push(tr!("App: {app_label}", app_label));
     }
     if !snapshot.app_id.is_empty() {
-        lines.push(format!("ID: {}", snapshot.app_id));
+        lines.push(tr!("ID: {app_id}", app_id = snapshot.app_id));
     }
     if !snapshot.title.is_empty() {
-        lines.push(format!("Title: {}", snapshot.title));
+        lines.push(tr!("Title: {title}", title = snapshot.title));
     }
     if let Some(output) = &snapshot.output {
-        lines.push(format!("Output: {}", output));
+        lines.push(tr!("Output: {output}", output));
     }
 
     let tooltip_text = if lines.is_empty() {
