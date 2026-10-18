@@ -10,7 +10,16 @@ Build dependencies and steps are in the [Installation wiki](https://github.com/p
 cargo run    # starts a panel, stop your normal one first
 ```
 
-[docs/architecture.md](docs/architecture.md) explains how services, widgets and compositor backends fit together, including how to add a widget or a compositor backend.
+## How the code fits together
+
+`vibepanel-core` holds config parsing, validation and theming, with no GTK. `vibepanel` is the GTK app, with system integration in `services/` and bar widgets in `widgets/`.
+
+- **Services** are main-thread singletons (`FooService::global()`) that notify widgets through `Callbacks`. `connect()` returns a `CallbackId`; keep it and `disconnect()` when the widget goes away.
+- **Threads:** GTK only on the main thread. Background work (IPC, blocking I/O) hands results back with `glib::idle_add_once`.
+- **Widgets:** start from a similar one in `widgets/`. Parse options in `WidgetConfig::from_entry` (call `warn_unknown_options`) and register the widget in `WidgetFactory::build`.
+- **Compositors:** widgets use `CompositorManager` or the services built on it (`WorkspaceService`, `WindowTitleService`, ...), never compositor IPC directly. A new backend implements `CompositorBackend` (`services/compositor/types.rs`), gets detected in `factory.rs` and is added to `VALID_COMPOSITORS`.
+- **CSS classes** live in `styles.rs`. Prefix names that collide with GTK or Adwaita with `vp-`.
+- **User docs** live in the [wiki](https://github.com/prankstr/vibepanel/wiki), which can't take PRs. For new or changed options, put the wiki text in the PR description.
 
 ## Making changes
 
