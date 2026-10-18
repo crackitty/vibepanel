@@ -3,7 +3,7 @@
 # =============================================================================
 #
 # Minimal starter config. For all available options, see:
-# https://github.com/prankstr/vibepanel/blob/main/docs/configuration.md
+# https://github.com/prankstr/vibepanel/wiki/Configuration
 #
 # Commands:
 #   vibepanel --check-config         Validate configuration

@@ -14,7 +14,6 @@ path = "src/main.rs"
 vibepanel-core = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
-anyhow = { workspace = true }
 chrono = { workspace = true }
 gtk4 = { workspace = true }
 pango = { workspace = true }
