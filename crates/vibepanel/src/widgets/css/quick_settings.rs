@@ -170,6 +170,54 @@ window.qs-wifi-qr-window {{
     min-height: calc(var(--font-size) * 0.85);
 }}
 
+/* Inline password prompt under a network row: no row padding, so the entry
+   and checkbox line up with the rows' left edge. */
+.qs-password-row {{
+    padding: 0;
+    margin: 3px 0;
+    background: none;
+}}
+
+/* Checkbox: a secondary option, so muted, compact text with a box sized to
+   it; accent filled when ticked. */
+.qs-check {{
+    padding: 0;
+}}
+
+/* Slight indent for the checkbox and status text, between the row edge and
+   the entry text inset. */
+.qs-password-row .qs-password-indent {{
+    margin-left: 8px;
+}}
+
+.qs-check label {{
+    color: var(--color-foreground-muted);
+    font-size: calc(var(--font-size) * 0.9);
+}}
+
+.qs-check check {{
+    min-width: calc(var(--font-size) * 0.7);
+    min-height: calc(var(--font-size) * 0.7);
+    margin: 0 6px 0 0;
+    padding: 1px;
+    border: 1px solid var(--color-foreground-muted);
+    border-radius: calc(var(--slider-radius-thick) * 0.5);
+    background: none;
+    box-shadow: none;
+    color: transparent;
+    -gtk-icon-size: calc(var(--font-size) * 0.6);
+}}
+
+.qs-check:hover check {{
+    border-color: var(--color-foreground-primary);
+}}
+
+.qs-check check:checked {{
+    background-color: var(--color-accent-primary);
+    border-color: var(--color-accent-primary);
+    color: var(--color-accent-text, #fff);
+}}
+
 /* Updates header row in expanded details (refresh button + last check) */
 .qs-updates-header-row {{
     padding: 0 0 0 8px;

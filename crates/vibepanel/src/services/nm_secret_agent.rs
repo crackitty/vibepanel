@@ -1,8 +1,13 @@
-//! NetworkManager SecretAgent for VPN authentication.
+//! NetworkManager SecretAgent for VPN and Wi-Fi authentication.
 //!
 //! Implements the `org.freedesktop.NetworkManager.SecretAgent` D-Bus interface
-//! to handle VPN password prompts directly in the panel, eliminating the need
-//! for nm-applet.
+//! to handle VPN and Wi-Fi password prompts directly in the panel, eliminating
+//! the need for nm-applet.
+//!
+//! Wi-Fi secrets (`802-11-wireless-security`) are only answered while the panel
+//! is activating that same network, so requests we didn't trigger (autoconnect,
+//! resume) stay with agents that may hold the secret in a keyring. Every
+//! request we can't serve gets `NoSecrets`, so NetworkManager asks the next agent.
 //!
 //! When NetworkManager activates a VPN connection that requires credentials,
 //! it calls `GetSecrets` on registered secret agents. This module:
@@ -42,9 +47,27 @@ const AGENT_IDENTIFIER: &str = "vibepanel";
 
 /// D-Bus error returned when the user cancels authentication.
 const AGENT_ERROR_USER_CANCELED: &str = "org.freedesktop.NetworkManager.SecretAgent.UserCanceled";
+/// D-Bus error returned for requests this agent can't serve; NM asks the next agent.
+const AGENT_ERROR_NO_SECRETS: &str = "org.freedesktop.NetworkManager.SecretAgent.NoSecrets";
+/// D-Bus error for operations this agent doesn't support.
+const AGENT_ERROR_FAILED: &str = "org.freedesktop.NetworkManager.SecretAgent.Failed";
 
-/// Timeout for pending auth requests (seconds). Auto-cancels if no user response.
-const AUTH_TIMEOUT_SECS: u64 = 120;
+const VPN_SETTING: &str = "vpn";
+const WIFI_SECURITY_SETTING: &str = "802-11-wireless-security";
+
+/// `NMSettingSecretFlags`: the secret is stored by a user agent, not NM.
+const SECRET_FLAG_AGENT_OWNED: u32 = 0x1;
+/// `NMSettingSecretFlags`: the secret is never stored ("always ask").
+const SECRET_FLAG_NOT_SAVED: u32 = 0x2;
+/// `NMSettingSecretFlags`: the secret is not needed.
+const SECRET_FLAG_NOT_REQUIRED: u32 = 0x4;
+
+/// Retries for `RegisterWithCapabilities` while another process holds our identifier.
+const REGISTER_RETRIES: u32 = 5;
+const REGISTER_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Timeout for pending auth requests. Auto-cancels if no user response.
+pub(crate) const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// GetSecrets flag: agent may prompt the user.
 const FLAG_ALLOW_INTERACTION: u32 = 0x1;
@@ -109,6 +132,44 @@ pub struct VpnAuthRequest {
     pub description: Option<String>,
 }
 
+/// A Wi-Fi password request from NetworkManager for the network being activated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WifiAuthRequest {
+    /// Agent request id; pass back to [`NmSecretAgent::submit_wifi_secret`].
+    pub id: u64,
+    pub ssid: String,
+    /// Previous secret was rejected (NM sent `REQUEST_NEW`).
+    pub is_retry: bool,
+    /// The profile's secret is agent-owned, so NM won't store what we return.
+    /// The UI offers to save it into the profile instead.
+    pub offer_save: bool,
+    /// The same attempt already chose to save (set by NmService on a retry),
+    /// so the UI shows "Save password" ticked.
+    pub save_ticked: bool,
+    /// Settings object path of the profile.
+    pub connection_path: String,
+    /// Secret key in `802-11-wireless-security` (`psk` or `wep-keyN`).
+    pub secret_key: String,
+    /// Flags property for `secret_key` (`psk-flags` or `wep-key-flags`).
+    pub flags_key: String,
+}
+
+/// What a Wi-Fi `GetSecrets` request asks for, parsed from the connection dict.
+#[derive(Debug, PartialEq, Eq)]
+struct WifiSecretSpec {
+    ssid: String,
+    secret_key: String,
+    flags_key: String,
+    offer_save: bool,
+}
+
+/// Which UI a pending request belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestKind {
+    Vpn,
+    Wifi,
+}
+
 /// Parsed VPN plugin metadata from a `.name` file.
 struct VpnPluginInfo {
     /// VPN service D-Bus name (e.g., "org.freedesktop.NetworkManager.openvpn").
@@ -150,7 +211,7 @@ enum AuthDialogResult {
     Error(String),
 }
 
-/// How a pending request ends; see [`VpnSecretAgent::finish`].
+/// How a pending request ends; see [`NmSecretAgent::finish`].
 enum End {
     Secrets(Vec<(String, String)>),
     Cancel(String),
@@ -161,12 +222,13 @@ enum End {
 struct PendingSecretRequest {
     /// Identifies this request to callbacks that may outlive it.
     id: u64,
+    kind: RequestKind,
     invocation: gio::DBusMethodInvocation,
     /// Connection path for matching cancel requests.
     connection_path: String,
     /// Setting name for matching cancel requests.
     setting_name: String,
-    /// GLib timeout source that fires after AUTH_TIMEOUT_SECS.
+    /// GLib timeout source that fires after AUTH_TIMEOUT.
     timeout_source: Option<glib::SourceId>,
     /// Child auth-dialog PID (shared with background thread). Killed on cancel/timeout.
     child_pid: Option<Arc<Mutex<Option<u32>>>>,
@@ -180,37 +242,42 @@ struct PendingSecretRequest {
 
 /// NetworkManager SecretAgent implementation.
 ///
-/// This is a thread-local singleton that lives alongside VpnService.
-/// It registers a D-Bus object on the system bus to handle NM's secret
-/// requests for VPN connections.
-pub struct VpnSecretAgent {
+/// This is a thread-local singleton that handles NM's secret requests for VPN
+/// and Wi-Fi connections.
+pub struct NmSecretAgent {
     /// D-Bus registration ID for the agent object.
     agent_registration_id: RefCell<Option<gio::RegistrationId>>,
-    /// Pending secret request waiting for user response.
-    pending_request: RefCell<Option<PendingSecretRequest>>,
+    /// Requests waiting for user response, at most one per kind so a VPN and
+    /// a Wi-Fi prompt can be open at the same time.
+    pending: RefCell<Vec<PendingSecretRequest>>,
     last_request_id: Cell<u64>,
+    /// Whether a VPN UI exists to prompt in. Without one, VPN requests are
+    /// declined so another agent (e.g. nm-applet) can answer them.
+    vpn_enabled: Cell<bool>,
 }
 
-impl VpnSecretAgent {
+impl NmSecretAgent {
     fn new() -> Self {
         Self {
             agent_registration_id: RefCell::new(None),
-            pending_request: RefCell::new(None),
+            pending: RefCell::new(Vec::new()),
             last_request_id: Cell::new(0),
+            vpn_enabled: Cell::new(false),
         }
     }
 
-    /// Get the global VpnSecretAgent singleton.
+    /// Get the global NmSecretAgent singleton.
     pub fn global() -> Rc<Self> {
         thread_local! {
-            static INSTANCE: Rc<VpnSecretAgent> = Rc::new(VpnSecretAgent::new());
+            static INSTANCE: Rc<NmSecretAgent> = Rc::new(NmSecretAgent::new());
         }
         INSTANCE.with(|s| s.clone())
     }
 
     /// Initialize and register the secret agent on the given D-Bus connection.
     ///
-    /// Called from VpnService::init_dbus once the system bus is available.
+    /// Called from NmService and VpnService once the system bus is available;
+    /// repeated calls are no-ops.
     pub fn register(connection: &gio::DBusConnection) {
         let agent = Self::global();
 
@@ -222,7 +289,7 @@ impl VpnSecretAgent {
         let node_info = match gio::DBusNodeInfo::for_xml(AGENT_INTROSPECTION) {
             Ok(info) => info,
             Err(e) => {
-                error!("VpnSecretAgent: failed to parse introspection XML: {}", e);
+                error!("NmSecretAgent: failed to parse introspection XML: {}", e);
                 return;
             }
         };
@@ -230,7 +297,7 @@ impl VpnSecretAgent {
         let interface_info = match node_info.lookup_interface(AGENT_IFACE) {
             Some(info) => info,
             None => {
-                error!("VpnSecretAgent: interface not found in introspection");
+                error!("NmSecretAgent: interface not found in introspection");
                 return;
             }
         };
@@ -247,35 +314,46 @@ impl VpnSecretAgent {
 
         match registration {
             Ok(id) => {
-                debug!("VpnSecretAgent: registered object at {}", AGENT_PATH);
+                debug!("NmSecretAgent: registered object at {}", AGENT_PATH);
                 *agent.agent_registration_id.borrow_mut() = Some(id);
 
-                // Register with NM's AgentManager
-                Self::register_with_agent_manager(connection);
+                // Register with each NM instance's AgentManager as it appears
+                // (now, and again after NM restarts). The agent lives for the
+                // whole process, so the watch is never removed.
+                gio::bus_watch_name_on_connection(
+                    connection,
+                    NM_SERVICE,
+                    gio::BusNameWatcherFlags::NONE,
+                    |connection, _name, _owner| {
+                        Self::register_with_agent_manager(&connection, REGISTER_RETRIES);
+                    },
+                    |_connection, _name| {
+                        let ids: Vec<u64> = Self::global()
+                            .pending
+                            .borrow()
+                            .iter()
+                            .map(|p| p.id)
+                            .collect();
+                        for id in ids {
+                            Self::finish(id, End::Cancel("NetworkManager exited".to_string()));
+                        }
+                    },
+                );
             }
             Err(e) => {
-                error!("VpnSecretAgent: failed to register D-Bus object: {}", e);
+                error!("NmSecretAgent: failed to register D-Bus object: {}", e);
             }
         }
     }
 
-    /// Re-register with a new NetworkManager instance after NM restarts.
-    ///
-    /// The D-Bus object at `AGENT_PATH` remains registered on the bus connection,
-    /// but the new NM process doesn't know about us. This calls
-    /// `RegisterWithCapabilities` again so the new NM dispatches GetSecrets to us.
-    pub fn re_register_with_agent_manager(connection: &gio::DBusConnection) {
-        let agent = Self::global();
-        if agent.agent_registration_id.borrow().is_none() {
-            // Not registered at all yet — do a full register instead
-            Self::register(connection);
-            return;
-        }
-        Self::register_with_agent_manager(connection);
+    /// Answer VPN requests; called by VpnService, which shows the prompts.
+    pub fn enable_vpn() {
+        Self::global().vpn_enabled.set(true);
     }
 
     /// Register with NetworkManager's AgentManager.
-    fn register_with_agent_manager(connection: &gio::DBusConnection) {
+    fn register_with_agent_manager(connection: &gio::DBusConnection, retries: u32) {
+        let retry_connection = connection.clone();
         gio::DBusProxy::new(
             connection,
             gio::DBusProxyFlags::NONE,
@@ -288,7 +366,7 @@ impl VpnSecretAgent {
                 let proxy = match res {
                     Ok(p) => p,
                     Err(e) => {
-                        error!("VpnSecretAgent: failed to create AgentManager proxy: {}", e);
+                        error!("NmSecretAgent: failed to create AgentManager proxy: {}", e);
                         return;
                     }
                 };
@@ -304,17 +382,31 @@ impl VpnSecretAgent {
                     None::<&gio::Cancellable>,
                     move |res| match res {
                         Ok(_) => {
-                            debug!("VpnSecretAgent: registered with AgentManager");
+                            debug!("NmSecretAgent: registered with AgentManager");
                         }
                         Err(e) => {
                             let error_name = gio::DBusError::remote_error(&e);
                             let error_str = error_name.as_ref().map(|s| s.as_str()).unwrap_or("");
 
-                            if error_str.contains("AlreadyRegistered") {
-                                debug!("VpnSecretAgent: already registered with AgentManager");
+                            // We register once per NM instance, so this is another
+                            // process, usually a vibepanel instance still exiting.
+                            if error_str
+                                == "org.freedesktop.NetworkManager.AgentManager.PermissionDenied"
+                                && e.message().contains("already registered")
+                                && retries > 0
+                            {
+                                debug!(
+                                    "NmSecretAgent: identifier held by another process, retrying"
+                                );
+                                glib::timeout_add_local_once(REGISTER_RETRY_DELAY, move || {
+                                    Self::register_with_agent_manager(
+                                        &retry_connection,
+                                        retries - 1,
+                                    );
+                                });
                             } else {
                                 error!(
-                                    "VpnSecretAgent: failed to register with AgentManager: {}",
+                                    "NmSecretAgent: failed to register with AgentManager: {}",
                                     e
                                 );
                             }
@@ -327,17 +419,21 @@ impl VpnSecretAgent {
 
     /// Dispatch incoming D-Bus method calls.
     fn handle_method(method: &str, params: Variant, invocation: gio::DBusMethodInvocation) {
-        debug!("VpnSecretAgent: method '{}' called", method);
+        debug!("NmSecretAgent: method '{}' called", method);
 
         match method {
             "GetSecrets" => Self::handle_get_secrets(params, invocation),
             "CancelGetSecrets" => Self::handle_cancel_get_secrets(params, invocation),
-            "SaveSecrets" | "DeleteSecrets" => {
-                // No-op — let NM handle secret storage
-                invocation.return_value(None);
+            // NM stops at the first agent that reports a save as done, so decline
+            // and let a storing agent (e.g. a keyring) have it.
+            "SaveSecrets" => {
+                invocation
+                    .return_dbus_error(AGENT_ERROR_FAILED, "vibepanel does not store secrets");
             }
+            // NM asks every agent to delete regardless of the reply.
+            "DeleteSecrets" => invocation.return_value(None),
             _ => {
-                error!("VpnSecretAgent: unknown method: {}", method);
+                error!("NmSecretAgent: unknown method: {}", method);
                 invocation.return_error(
                     gio::IOErrorEnum::NotSupported,
                     &format!("Unknown method: {method}"),
@@ -346,18 +442,18 @@ impl VpnSecretAgent {
         }
     }
 
-    /// Handle GetSecrets — NM is asking for VPN connection secrets.
+    /// Handle GetSecrets — NM is asking for VPN or Wi-Fi connection secrets.
     fn handle_get_secrets(params: Variant, invocation: gio::DBusMethodInvocation) {
         // Parse parameters: (a{sa{sv}}, o, s, as, u)
         debug!(
-            "VpnSecretAgent: GetSecrets params type={}, n_children={}",
+            "NmSecretAgent: GetSecrets params type={}, n_children={}",
             params.type_(),
             params.n_children()
         );
 
         if params.n_children() < 5 {
             error!(
-                "VpnSecretAgent: GetSecrets expected 5 params, got {}",
+                "NmSecretAgent: GetSecrets expected 5 params, got {}",
                 params.n_children()
             );
             invocation.return_error(
@@ -378,28 +474,36 @@ impl VpnSecretAgent {
         let flags: u32 = params.child_value(4).get().unwrap_or(0);
 
         debug!(
-            "VpnSecretAgent: GetSecrets for path={}, setting={}, flags=0x{:x}",
+            "NmSecretAgent: GetSecrets for path={}, setting={}, flags=0x{:x}",
             connection_path, setting_name, flags
         );
 
-        // Only handle VPN secrets
-        if setting_name != "vpn" {
-            debug!(
-                "VpnSecretAgent: ignoring non-VPN setting '{}'",
-                setting_name
-            );
-            // Return empty dict for non-VPN settings
-            let empty = Self::build_empty_secrets_dict();
-            invocation.return_value(Some(&empty));
+        // We have no stored secrets, so without interaction there's nothing to give.
+        if flags & FLAG_ALLOW_INTERACTION == 0 && flags & FLAG_REQUEST_NEW == 0 {
+            no_secrets(invocation, "interaction not allowed");
             return;
         }
 
-        // If interaction is not allowed, return empty (NM is just probing)
-        if flags & FLAG_ALLOW_INTERACTION == 0 && flags & FLAG_REQUEST_NEW == 0 {
-            debug!("VpnSecretAgent: interaction not allowed, returning empty");
-            let empty = Self::build_empty_secrets_dict();
-            invocation.return_value(Some(&empty));
-            return;
+        match setting_name.as_str() {
+            VPN_SETTING if !Self::global().vpn_enabled.get() => {
+                no_secrets(invocation, "VPN prompts are not enabled");
+                return;
+            }
+            VPN_SETTING => {}
+            WIFI_SECURITY_SETTING => {
+                Self::handle_wifi_get_secrets(
+                    &connection_dict,
+                    connection_path,
+                    setting_name,
+                    flags,
+                    invocation,
+                );
+                return;
+            }
+            _ => {
+                no_secrets(invocation, &format!("unsupported setting '{setting_name}'"));
+                return;
+            }
         }
 
         // Extract connection info from the connection dict
@@ -425,7 +529,7 @@ impl VpnSecretAgent {
             && plugin.auth_dialog.is_some()
         {
             debug!(
-                "VpnSecretAgent: found auth-dialog for service '{}', external-ui={}",
+                "NmSecretAgent: found auth-dialog for service '{}', external-ui={}",
                 svc, plugin.supports_external_ui_mode
             );
 
@@ -446,7 +550,7 @@ impl VpnSecretAgent {
         }
 
         // Fallback: no auth-dialog found, infer fields from -flags
-        debug!("VpnSecretAgent: no auth-dialog found, using -flags fallback");
+        debug!("NmSecretAgent: no auth-dialog found, using -flags fallback");
         Self::handle_get_secrets_fallback(
             &connection_dict,
             &uuid,
@@ -458,6 +562,54 @@ impl VpnSecretAgent {
             setting_name,
             is_retry,
         );
+    }
+
+    /// Handle a Wi-Fi `GetSecrets`: prompt only if the panel is activating this network.
+    fn handle_wifi_get_secrets(
+        connection_dict: &Variant,
+        connection_path: String,
+        setting_name: String,
+        flags: u32,
+        invocation: gio::DBusMethodInvocation,
+    ) {
+        let spec = match wifi_secret_spec(connection_dict) {
+            Ok(spec) => spec,
+            Err(reason) => {
+                no_secrets(invocation, reason);
+                return;
+            }
+        };
+        let connecting = super::network::NmService::connecting_wifi_ssid();
+        if connecting.as_deref() != Some(spec.ssid.as_str()) {
+            no_secrets(invocation, "panel is not activating this network");
+            return;
+        }
+
+        let id = Self::start_request(
+            invocation,
+            RequestKind::Wifi,
+            connection_path.clone(),
+            setting_name,
+            None,
+            false,
+        );
+        debug!(
+            "NmSecretAgent: requesting Wi-Fi secret '{}' for '{}' (retry={}, offer_save={})",
+            spec.secret_key,
+            spec.ssid,
+            flags & FLAG_REQUEST_NEW != 0,
+            spec.offer_save
+        );
+        super::network::network_manager::wifi_auth_requested(WifiAuthRequest {
+            id,
+            ssid: spec.ssid,
+            is_retry: flags & FLAG_REQUEST_NEW != 0,
+            offer_save: spec.offer_save,
+            save_ticked: false,
+            connection_path,
+            secret_key: spec.secret_key,
+            flags_key: spec.flags_key,
+        });
     }
 
     /// Fallback GetSecrets handler: infer fields from vpn.data `-flags` keys.
@@ -515,14 +667,21 @@ impl VpnSecretAgent {
         };
 
         debug!(
-            "VpnSecretAgent: requesting auth for '{}' (uuid={}, retry={}, fields={})",
+            "NmSecretAgent: requesting auth for '{}' (uuid={}, retry={}, fields={})",
             name,
             uuid,
             is_retry,
             auth_request.fields.len()
         );
 
-        Self::start_request(invocation, connection_path, setting_name, None, false);
+        Self::start_request(
+            invocation,
+            RequestKind::Vpn,
+            connection_path,
+            setting_name,
+            None,
+            false,
+        );
 
         // Notify VPN service about the auth request
         super::vpn::send_vpn_update(super::vpn::VpnUpdate::AuthRequest(auth_request));
@@ -551,7 +710,7 @@ impl VpnSecretAgent {
         let auth_dialog_path = match plugin.auth_dialog {
             Some(ref p) => p.clone(),
             None => {
-                error!("VpnSecretAgent: spawn_auth_dialog called without auth-dialog path");
+                error!("NmSecretAgent: spawn_auth_dialog called without auth-dialog path");
                 invocation.return_dbus_error(AGENT_ERROR_USER_CANCELED, "No auth-dialog available");
                 return;
             }
@@ -600,6 +759,7 @@ impl VpnSecretAgent {
 
         let id = Self::start_request(
             invocation,
+            RequestKind::Vpn,
             connection_path,
             setting_name,
             Some(child_pid),
@@ -608,7 +768,7 @@ impl VpnSecretAgent {
 
         // Spawn auth-dialog on a background thread
         debug!(
-            "VpnSecretAgent: spawning auth-dialog: {} {}",
+            "NmSecretAgent: spawning auth-dialog: {} {}",
             auth_dialog_path,
             if use_external_ui {
                 "(external-ui)"
@@ -653,7 +813,7 @@ impl VpnSecretAgent {
         match result {
             AuthDialogResult::Secrets(secrets) => {
                 debug!(
-                    "VpnSecretAgent: auth-dialog returned {} secret(s)",
+                    "NmSecretAgent: auth-dialog returned {} secret(s)",
                     secrets.len()
                 );
                 Self::finish(id, End::Secrets(secrets));
@@ -672,7 +832,7 @@ impl VpnSecretAgent {
                 if ask_fields.is_empty() {
                     // No fields need asking — return all secret values directly
                     debug!(
-                        "VpnSecretAgent: external-ui has no fields to ask, returning existing secrets"
+                        "NmSecretAgent: external-ui has no fields to ask, returning existing secrets"
                     );
                     let secrets: Vec<(String, String)> = fields
                         .iter()
@@ -720,29 +880,29 @@ impl VpnSecretAgent {
                 };
 
                 debug!(
-                    "VpnSecretAgent: external-ui requesting {} field(s) for inline prompt",
+                    "NmSecretAgent: external-ui requesting {} field(s) for inline prompt",
                     auth_request.fields.len()
                 );
 
                 // Only prompt if this request is still pending (not ended by a
                 // timeout, cancel or newer request while the auth-dialog ran).
                 let agent = Self::global();
-                let mut pending = agent.pending_request.borrow_mut();
-                if let Some(pending) = pending.as_mut().filter(|p| p.id == id) {
+                let mut pending = agent.pending.borrow_mut();
+                if let Some(pending) = pending.iter_mut().find(|p| p.id == id) {
                     pending.prefilled_secrets = prefilled;
                     super::vpn::send_vpn_update(super::vpn::VpnUpdate::AuthRequest(auth_request));
                 } else {
-                    debug!("VpnSecretAgent: request {id} already finished, skipping auth prompt");
+                    debug!("NmSecretAgent: request {id} already finished, skipping auth prompt");
                 }
             }
 
             AuthDialogResult::Cancelled => {
-                debug!("VpnSecretAgent: auth-dialog cancelled by user");
+                debug!("NmSecretAgent: auth-dialog cancelled by user");
                 Self::finish(id, End::Cancel("User canceled".to_string()));
             }
 
             AuthDialogResult::Error(msg) => {
-                error!("VpnSecretAgent: auth-dialog error: {}", msg);
+                error!("NmSecretAgent: auth-dialog error: {}", msg);
                 // Cancel the pending request and let NM retry
                 Self::finish(id, End::Cancel(format!("Auth dialog failed: {msg}")));
             }
@@ -753,7 +913,7 @@ impl VpnSecretAgent {
     fn handle_cancel_get_secrets(params: Variant, invocation: gio::DBusMethodInvocation) {
         if params.n_children() < 2 {
             error!(
-                "VpnSecretAgent: CancelGetSecrets expected 2 params, got {}",
+                "NmSecretAgent: CancelGetSecrets expected 2 params, got {}",
                 params.n_children()
             );
             invocation.return_value(None);
@@ -768,15 +928,15 @@ impl VpnSecretAgent {
         let setting_name: String = params.child_value(1).get().unwrap_or_default();
 
         debug!(
-            "VpnSecretAgent: CancelGetSecrets for path={}, setting={}",
+            "NmSecretAgent: CancelGetSecrets for path={}, setting={}",
             connection_path, setting_name
         );
 
         let matching = Self::global()
-            .pending_request
+            .pending
             .borrow()
-            .as_ref()
-            .filter(|p| p.connection_path == connection_path && p.setting_name == setting_name)
+            .iter()
+            .find(|p| p.connection_path == connection_path && p.setting_name == setting_name)
             .map(|p| p.id);
         if let Some(id) = matching {
             Self::finish(id, End::Cancel("Canceled by NetworkManager".to_string()));
@@ -785,48 +945,76 @@ impl VpnSecretAgent {
         invocation.return_value(None);
     }
 
-    /// Submit secrets in response to a pending auth request.
+    /// Submit secrets in response to a pending VPN auth request.
     ///
     /// Called by VpnService when the user submits credentials from the UI.
     /// `secrets` is a list of (key, value) pairs (e.g., [("password", "hunter2")]).
     pub fn submit_secrets(secrets: &[(String, String)]) {
-        let Some(id) = Self::current_id() else {
-            debug!("VpnSecretAgent: submit_secrets called but no pending request");
+        let Some(id) = Self::current_id(RequestKind::Vpn) else {
+            debug!("NmSecretAgent: submit_secrets called but no pending VPN request");
             return;
         };
         debug!(
-            "VpnSecretAgent: submitting {} user-provided secret(s)",
+            "NmSecretAgent: submitting {} user-provided secret(s)",
             secrets.len()
         );
         Self::finish(id, End::Secrets(secrets.to_vec()));
     }
 
-    /// Cancel a pending auth request (user pressed Cancel in the UI).
+    /// Cancel a pending VPN auth request (user pressed Cancel in the UI).
     pub fn cancel_auth() {
-        if let Some(id) = Self::current_id() {
-            debug!("VpnSecretAgent: user cancelled auth");
+        if let Some(id) = Self::current_id(RequestKind::Vpn) {
+            debug!("NmSecretAgent: user cancelled VPN auth");
             Self::finish(id, End::Cancel("User canceled".to_string()));
         }
     }
 
-    fn current_id() -> Option<u64> {
+    /// Answer Wi-Fi request `request` with the password the user entered.
+    /// Returns false if the request is no longer pending.
+    pub fn submit_wifi_secret(request: &WifiAuthRequest, secret: &str) -> bool {
+        if Self::current_id(RequestKind::Wifi) != Some(request.id) {
+            debug!(
+                "NmSecretAgent: Wi-Fi request {} is no longer pending",
+                request.id
+            );
+            return false;
+        }
+        Self::finish(
+            request.id,
+            End::Secrets(vec![(request.secret_key.clone(), secret.to_string())]),
+        );
+        true
+    }
+
+    /// Cancel Wi-Fi request `id` (user pressed Cancel, or the attempt was replaced).
+    pub fn cancel_wifi_auth(id: u64) {
+        if Self::current_id(RequestKind::Wifi) == Some(id) {
+            debug!("NmSecretAgent: Wi-Fi auth {id} cancelled");
+            Self::finish(id, End::Cancel("User canceled".to_string()));
+        }
+    }
+
+    fn current_id(kind: RequestKind) -> Option<u64> {
         Self::global()
-            .pending_request
+            .pending
             .borrow()
-            .as_ref()
+            .iter()
+            .find(|p| p.kind == kind)
             .map(|p| p.id)
     }
 
-    /// Make `invocation` the pending request, ending any current one, and arm
-    /// its timeout. Returns the id to pass to [`Self::finish`].
+    /// Make `invocation` the pending request of its kind, ending the current
+    /// one of that kind, and arm its timeout. Returns the id to pass to
+    /// [`Self::finish`].
     fn start_request(
         invocation: gio::DBusMethodInvocation,
+        kind: RequestKind,
         connection_path: String,
         setting_name: String,
         child_pid: Option<Arc<Mutex<Option<u32>>>>,
         legacy_dialog: bool,
     ) -> u64 {
-        if let Some(id) = Self::current_id() {
+        if let Some(id) = Self::current_id(kind) {
             Self::finish(
                 id,
                 End::Cancel("Superseded by new auth request".to_string()),
@@ -835,16 +1023,16 @@ impl VpnSecretAgent {
         let agent = Self::global();
         let id = agent.last_request_id.get() + 1;
         agent.last_request_id.set(id);
-        let timeout_source =
-            glib::timeout_add_local_once(Duration::from_secs(AUTH_TIMEOUT_SECS), move || {
-                warn!(
-                    "VpnSecretAgent: auth request timed out after {}s",
-                    AUTH_TIMEOUT_SECS
-                );
-                Self::finish(id, End::TimedOut);
-            });
-        *agent.pending_request.borrow_mut() = Some(PendingSecretRequest {
+        let timeout_source = glib::timeout_add_local_once(AUTH_TIMEOUT, move || {
+            warn!(
+                "NmSecretAgent: auth request timed out after {}s",
+                AUTH_TIMEOUT.as_secs()
+            );
+            Self::finish(id, End::TimedOut);
+        });
+        agent.pending.borrow_mut().push(PendingSecretRequest {
             id,
+            kind,
             invocation,
             connection_path,
             setting_name,
@@ -863,15 +1051,14 @@ impl VpnSecretAgent {
     fn finish(id: u64, end: End) {
         let agent = Self::global();
         let pending = {
-            let mut slot = agent.pending_request.borrow_mut();
-            if slot.as_ref().is_some_and(|p| p.id == id) {
-                slot.take()
-            } else {
-                None
-            }
+            let mut pending = agent.pending.borrow_mut();
+            pending
+                .iter()
+                .position(|p| p.id == id)
+                .map(|index| pending.remove(index))
         };
         let Some(mut pending) = pending else {
-            debug!("VpnSecretAgent: request {id} already finished");
+            debug!("NmSecretAgent: request {id} already finished");
             return;
         };
 
@@ -891,7 +1078,14 @@ impl VpnSecretAgent {
                     pending.prefilled_secrets.into_iter().collect();
                 merged.extend(secrets);
                 let merged: Vec<(String, String)> = merged.into_iter().collect();
-                let response = Self::build_secrets_response(&pending.setting_name, &merged);
+                let response = match pending.kind {
+                    RequestKind::Vpn => {
+                        Self::build_secrets_response(&pending.setting_name, &merged)
+                    }
+                    RequestKind::Wifi => {
+                        build_setting_secrets_response(&pending.setting_name, &merged)
+                    }
+                };
                 pending.invocation.return_value(Some(&response));
             }
             End::Cancel(msg) => pending
@@ -902,11 +1096,16 @@ impl VpnSecretAgent {
                 .return_dbus_error(AGENT_ERROR_USER_CANCELED, "Authentication timed out"),
         }
 
-        if pending.legacy_dialog {
-            // Restore the keyboard grab released for the dialog's own window.
-            super::vpn::send_vpn_update(super::vpn::VpnUpdate::LegacyAuthDialogFinished);
+        match pending.kind {
+            RequestKind::Vpn => {
+                if pending.legacy_dialog {
+                    // Restore the keyboard grab released for the dialog's own window.
+                    super::vpn::send_vpn_update(super::vpn::VpnUpdate::LegacyAuthDialogFinished);
+                }
+                super::vpn::send_vpn_update(super::vpn::VpnUpdate::AuthCleared);
+            }
+            RequestKind::Wifi => super::network::network_manager::wifi_auth_cleared(id),
         }
-        super::vpn::send_vpn_update(super::vpn::VpnUpdate::AuthCleared);
     }
 
     // --- Variant parsing helpers ---
@@ -981,13 +1180,6 @@ impl VpnSecretAgent {
         fields
     }
 
-    /// Build an empty secrets response dict: `(a{sa{sv}},)`.
-    fn build_empty_secrets_dict() -> Variant {
-        let entry_type = glib::VariantTy::new("{sa{sv}}").unwrap();
-        let empty = Variant::array_from_iter_with_type(entry_type, std::iter::empty::<Variant>());
-        Variant::tuple_from_iter([empty])
-    }
-
     /// Build the secrets response dict for a VPN connection.
     ///
     /// Format: `({ "vpn": { "secrets": { key: value, ... } } },)`
@@ -1026,6 +1218,63 @@ impl VpnSecretAgent {
         // Wrap in tuple for D-Bus return value: (a{sa{sv}})
         Variant::tuple_from_iter([outer])
     }
+}
+
+/// Decline a request so NetworkManager asks the next agent.
+fn no_secrets(invocation: gio::DBusMethodInvocation, reason: &str) {
+    debug!("NmSecretAgent: NoSecrets: {reason}");
+    invocation.return_dbus_error(AGENT_ERROR_NO_SECRETS, reason);
+}
+
+/// Build `({setting_name: {key: value, ...}},)` for settings whose secrets are
+/// plain string properties, like `802-11-wireless-security`.
+fn build_setting_secrets_response(setting_name: &str, secrets: &[(String, String)]) -> Variant {
+    let setting = glib::VariantDict::new(None);
+    for (key, value) in secrets {
+        setting.insert(key, value);
+    }
+    let entry = Variant::from_dict_entry(&setting_name.to_variant(), &setting.end());
+    let entry_type = glib::VariantTy::new("{sa{sv}}").unwrap();
+    Variant::tuple_from_iter([Variant::array_from_iter_with_type(entry_type, [entry])])
+}
+
+/// Work out which Wi-Fi secret a `GetSecrets` request needs, or why we can't
+/// provide it. Only passphrase-style secrets (WPA/WPA3 personal and static WEP)
+/// are supported; enterprise and LEAP need fields we don't prompt for.
+fn wifi_secret_spec(connection_dict: &Variant) -> Result<WifiSecretSpec, &'static str> {
+    let ssid = get_dict_section(connection_dict, "802-11-wireless")
+        .and_then(|wifi| get_variant_dict_value(&wifi, "ssid"))
+        .and_then(|ssid| ssid.get::<Vec<u8>>())
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .filter(|ssid| !ssid.is_empty())
+        .ok_or("Wi-Fi profile has no valid SSID")?;
+    let security =
+        get_dict_section(connection_dict, WIFI_SECURITY_SETTING).ok_or("no Wi-Fi security")?;
+    let key_mgmt = get_string_from_dict(&security, "key-mgmt").unwrap_or_default();
+    let (secret_key, flags_key) = match key_mgmt.as_str() {
+        "wpa-psk" | "sae" => ("psk".to_string(), "psk-flags"),
+        "none" if get_string_from_dict(&security, "auth-alg").as_deref() != Some("leap") => {
+            let index = get_u32_from_dict(&security, "wep-tx-keyidx").unwrap_or(0);
+            (format!("wep-key{index}"), "wep-key-flags")
+        }
+        _ => return Err("unsupported Wi-Fi security"),
+    };
+    // Properties at their default value are omitted from the dict.
+    let flags = get_u32_from_dict(&security, flags_key).unwrap_or(0);
+    if flags & SECRET_FLAG_NOT_REQUIRED != 0 {
+        return Err("secret not required");
+    }
+    // wep-key-flags covers all four WEP keys, but saving would write only
+    // this one and drop the others, so saving is PSK/SAE only.
+    let offer_save = secret_key == "psk"
+        && flags & SECRET_FLAG_AGENT_OWNED != 0
+        && flags & SECRET_FLAG_NOT_SAVED == 0;
+    Ok(WifiSecretSpec {
+        ssid,
+        secret_key,
+        flags_key: flags_key.to_string(),
+        offer_save,
+    })
 }
 
 // --- Auth-dialog process management ---
@@ -1067,16 +1316,13 @@ fn run_auth_dialog(
     let pid = child.id();
     *child_pid.lock().unwrap() = Some(pid);
 
-    debug!("VpnSecretAgent: auth-dialog spawned (pid={})", pid);
+    debug!("NmSecretAgent: auth-dialog spawned (pid={})", pid);
 
     // Write stdin data and close stdin
     if let Some(mut stdin) = child.stdin.take()
         && let Err(e) = stdin.write_all(stdin_data.as_bytes())
     {
-        warn!(
-            "VpnSecretAgent: failed to write stdin to auth-dialog: {}",
-            e
-        );
+        warn!("NmSecretAgent: failed to write stdin to auth-dialog: {}", e);
         // Continue anyway — some dialogs might not need stdin
     }
     // stdin is dropped here, closing the pipe
@@ -1087,7 +1333,7 @@ fn run_auth_dialog(
         && let Err(e) = stdout.read_to_string(&mut stdout_data)
     {
         warn!(
-            "VpnSecretAgent: failed to read stdout from auth-dialog: {}",
+            "NmSecretAgent: failed to read stdout from auth-dialog: {}",
             e
         );
     }
@@ -1104,7 +1350,7 @@ fn run_auth_dialog(
     *child_pid.lock().unwrap() = None;
 
     debug!(
-        "VpnSecretAgent: auth-dialog exited with status={}, stdout={} bytes",
+        "NmSecretAgent: auth-dialog exited with status={}, stdout={} bytes",
         exit_status,
         stdout_data.len()
     );
@@ -1140,7 +1386,7 @@ fn kill_child_process(child_pid: &Option<Arc<Mutex<Option<u32>>>>) {
         && let Some(pid) = *pid_lock.lock().unwrap()
     {
         debug!(
-            "VpnSecretAgent: killing auth-dialog process group (pid={})",
+            "NmSecretAgent: killing auth-dialog process group (pid={})",
             pid
         );
         unsafe {
@@ -1154,7 +1400,7 @@ fn kill_child_process(child_pid: &Option<Arc<Mutex<Option<u32>>>>) {
                 && stored_pid == pid
             {
                 debug!(
-                    "VpnSecretAgent: SIGKILL auth-dialog process group (pid={})",
+                    "NmSecretAgent: SIGKILL auth-dialog process group (pid={})",
                     pid
                 );
                 unsafe {
@@ -1276,7 +1522,7 @@ fn parse_external_ui_response(stdout: &str) -> Option<(String, String, Vec<Exter
     let version: u32 = header.get("Version")?.parse().ok()?;
     if version != 2 {
         warn!(
-            "VpnSecretAgent: unsupported external-ui version: {}",
+            "NmSecretAgent: unsupported external-ui version: {}",
             version
         );
         return None;
@@ -1393,7 +1639,7 @@ fn find_vpn_plugin(service_type: &str) -> Option<VpnPluginInfo> {
             Ok(d) => d,
             Err(e) => {
                 debug!(
-                    "VpnSecretAgent: cannot read VPN plugin dir {}: {}",
+                    "NmSecretAgent: cannot read VPN plugin dir {}: {}",
                     plugin_dir, e
                 );
                 continue;
@@ -1415,7 +1661,7 @@ fn find_vpn_plugin(service_type: &str) -> Option<VpnPluginInfo> {
 
             if info.service == service_type {
                 debug!(
-                    "VpnSecretAgent: found plugin for '{}' in {:?} (auth-dialog={:?}, external-ui={})",
+                    "NmSecretAgent: found plugin for '{}' in {:?} (auth-dialog={:?}, external-ui={})",
                     service_type, path, info.auth_dialog, info.supports_external_ui_mode
                 );
 
@@ -1424,7 +1670,7 @@ fn find_vpn_plugin(service_type: &str) -> Option<VpnPluginInfo> {
                     && !std::path::Path::new(dialog_path).exists()
                 {
                     debug!(
-                        "VpnSecretAgent: auth-dialog binary not found: {}",
+                        "NmSecretAgent: auth-dialog binary not found: {}",
                         dialog_path
                     );
                     return Some(VpnPluginInfo {
@@ -1439,7 +1685,7 @@ fn find_vpn_plugin(service_type: &str) -> Option<VpnPluginInfo> {
     }
 
     debug!(
-        "VpnSecretAgent: no plugin found for service type '{}'",
+        "NmSecretAgent: no plugin found for service type '{}'",
         service_type
     );
     None
@@ -1552,6 +1798,11 @@ fn get_string_from_dict(dict: &Variant, key: &str) -> Option<String> {
     None
 }
 
+/// Get a `u32` value from a dict (`a{sv}`).
+fn get_u32_from_dict(dict: &Variant, key: &str) -> Option<u32> {
+    get_variant_dict_value(dict, key)?.get::<u32>()
+}
+
 /// Extract all key/value pairs from a string dict (`a{ss}`).
 ///
 /// Used to build the DATA section of the auth-dialog stdin payload.
@@ -1626,5 +1877,96 @@ fn humanize_secret_key(key: &str) -> String {
             }
             result
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connection(security: Option<Vec<(&str, Variant)>>) -> Variant {
+        let mut settings: HashMap<String, HashMap<String, Variant>> = HashMap::from([(
+            "802-11-wireless".to_string(),
+            HashMap::from([("ssid".to_string(), b"cafe".to_vec().to_variant())]),
+        )]);
+        if let Some(security) = security {
+            settings.insert(
+                WIFI_SECURITY_SETTING.to_string(),
+                security
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+            );
+        }
+        settings.to_variant()
+    }
+
+    #[test]
+    fn wifi_spec_offers_saving_only_agent_owned_secrets() {
+        for (key_mgmt, flags, offer_save) in [
+            ("wpa-psk", None, false),
+            ("sae", Some(0), false),
+            ("wpa-psk", Some(SECRET_FLAG_AGENT_OWNED), true),
+            ("wpa-psk", Some(SECRET_FLAG_NOT_SAVED), false),
+            (
+                "wpa-psk",
+                Some(SECRET_FLAG_AGENT_OWNED | SECRET_FLAG_NOT_SAVED),
+                false,
+            ),
+        ] {
+            let mut security = vec![("key-mgmt", key_mgmt.to_variant())];
+            if let Some(flags) = flags {
+                security.push(("psk-flags", flags.to_variant()));
+            }
+            let spec = wifi_secret_spec(&connection(Some(security))).unwrap();
+            assert_eq!(
+                spec,
+                WifiSecretSpec {
+                    ssid: "cafe".into(),
+                    secret_key: "psk".into(),
+                    flags_key: "psk-flags".into(),
+                    offer_save,
+                },
+                "{key_mgmt} flags={flags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wifi_spec_uses_the_transmit_wep_key() {
+        let spec = wifi_secret_spec(&connection(Some(vec![
+            ("key-mgmt", "none".to_variant()),
+            ("wep-tx-keyidx", 2u32.to_variant()),
+            ("wep-key-flags", SECRET_FLAG_AGENT_OWNED.to_variant()),
+        ])))
+        .unwrap();
+        assert_eq!(spec.secret_key, "wep-key2");
+        assert_eq!(spec.flags_key, "wep-key-flags");
+        assert!(!spec.offer_save);
+    }
+
+    #[test]
+    fn wifi_spec_declines_what_it_cannot_prompt_for() {
+        for security in [
+            None,
+            Some(vec![("key-mgmt", "wpa-eap".to_variant())]),
+            Some(vec![("key-mgmt", "owe".to_variant())]),
+            Some(vec![
+                ("key-mgmt", "none".to_variant()),
+                ("auth-alg", "leap".to_variant()),
+            ]),
+            Some(vec![
+                ("key-mgmt", "wpa-psk".to_variant()),
+                ("psk-flags", SECRET_FLAG_NOT_REQUIRED.to_variant()),
+            ]),
+        ] {
+            assert!(wifi_secret_spec(&connection(security.clone())).is_err());
+        }
+
+        let no_ssid: HashMap<String, HashMap<String, Variant>> = HashMap::from([(
+            WIFI_SECURITY_SETTING.to_string(),
+            HashMap::from([("key-mgmt".to_string(), "wpa-psk".to_variant())]),
+        )]);
+        assert!(wifi_secret_spec(&no_ssid.to_variant()).is_err());
     }
 }

@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: vibepanel VERSION\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-10-16 15:04+0000\n"
+"POT-Creation-Date: 2026-10-19 17:53+0000\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -951,7 +951,7 @@ msgstr ""
 msgid "Connecting to {ssid}"
 msgstr ""
 
-#: ../src/widgets/quick_settings/bar_widget.rs ../src/widgets/quick_settings/network_card.rs ../src/widgets/quick_settings/network_card.rs ../src/widgets/quick_settings/network_card.rs
+#: ../src/widgets/quick_settings/bar_widget.rs ../src/widgets/quick_settings/network_card.rs
 msgid "Connecting..."
 msgstr ""
 
@@ -1170,9 +1170,17 @@ msgstr ""
 msgid "Wi-Fi"
 msgstr ""
 
+#: ../src/widgets/quick_settings/network_card.rs
+msgid "Save password"
+msgstr ""
+
 #. Update title
 #: ../src/widgets/quick_settings/network_card.rs ../src/widgets/quick_settings/network_card.rs
 msgid "Wired Connection"
+msgstr ""
+
+#: ../src/widgets/quick_settings/network_card.rs ../src/widgets/quick_settings/network_card.rs
+msgid "Connecting"
 msgstr ""
 
 #: ../src/widgets/quick_settings/network_card.rs
@@ -1201,10 +1209,6 @@ msgstr ""
 
 #: ../src/widgets/quick_settings/network_card.rs
 msgid "Enter password for {ssid}"
-msgstr ""
-
-#: ../src/widgets/quick_settings/network_card.rs ../src/widgets/quick_settings/network_card.rs
-msgid "Connecting"
 msgstr ""
 
 #: ../src/widgets/quick_settings/power_card.rs

@@ -346,11 +346,13 @@ impl NetworkSnapshot {
         }
     }
 
-    /// Check if there's a pending auth request (IWD only).
+    /// Check if there's a pending auth request.
     /// Returns the SSID of the network requesting authentication.
     pub fn auth_request_ssid(&self) -> Option<&str> {
         match self {
-            Self::NetworkManager(_) => None,
+            Self::NetworkManager(inner) => {
+                inner.wifi.auth_request.as_ref().map(|r| r.ssid.as_str())
+            }
             Self::Iwd(inner) => inner.auth_request.as_ref().map(|r| r.ssid.as_str()),
         }
     }
@@ -402,10 +404,11 @@ impl NetworkSnapshot {
 /// Automatically detects which backend is available at startup (preferring NM).
 /// NM supports Wi-Fi, wired, and mobile; IWD supports Wi-Fi only.
 ///
-/// Auth flow differs by backend: NM takes the password upfront via
-/// `connect_to_network(ssid, password, _)`, while IWD initiates connection
-/// first and calls back via the agent pattern — the UI then shows a password
-/// dialog and calls `submit_password()` to complete authentication.
+/// Auth flow differs by backend: NM takes the password upfront for new profiles
+/// via `connect_to_network(ssid, password, _)`, and asks through its secret
+/// agent when a saved profile has no stored password. IWD initiates connection
+/// first and always calls back via its agent. In both agent flows the UI shows
+/// a password dialog and calls `submit_password()` to complete authentication.
 pub struct NetworkService {
     backend: NetworkBackend,
 }
@@ -570,18 +573,21 @@ impl NetworkService {
         }
     }
 
-    /// Submit a password for a pending IWD auth request (no-op for NM).
-    pub fn submit_password(&self, password: &str) {
+    /// Submit a password for a pending auth request.
+    ///
+    /// `save` asks NM to keep a password it would otherwise forget (see
+    /// [`network_manager::WifiAuthRequest::offer_save`]); IWD ignores it.
+    pub fn submit_password(&self, password: &str, save: bool) {
         match &self.backend {
-            NetworkBackend::NetworkManager(_) => {}
+            NetworkBackend::NetworkManager(inner) => inner.submit_wifi_secret(password, save),
             NetworkBackend::Iwd(inner) => inner.submit_passphrase(password),
         }
     }
 
-    /// Cancel a pending auth request (IWD only).
+    /// Cancel a pending auth request.
     pub fn cancel_auth(&self) {
         match &self.backend {
-            NetworkBackend::NetworkManager(_) => {}
+            NetworkBackend::NetworkManager(inner) => inner.cancel_wifi_auth(),
             NetworkBackend::Iwd(inner) => inner.cancel_auth(),
         }
     }

@@ -23,9 +23,9 @@ use super::ui_helpers::{
 };
 use super::window::QuickSettingsWindow;
 use crate::services::icons::IconsService;
+use crate::services::nm_secret_agent::VpnAuthRequest;
 use crate::services::surfaces::SurfaceStyleManager;
 use crate::services::vpn::{VpnConnection, VpnService, VpnSnapshot};
-use crate::services::vpn_secret_agent::VpnAuthRequest;
 use crate::styles::{button, color, icon, qs, row, state};
 use crate::widgets::layer_shell_popover::animate_reveal;
 

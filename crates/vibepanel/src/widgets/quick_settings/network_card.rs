@@ -11,11 +11,11 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
-use gtk4::glib::{self, WeakRef};
+use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    ApplicationWindow, Box as GtkBox, Button, Entry, Label, ListBox, ListBoxRow, Orientation,
-    Overlay, Popover, ScrolledWindow, Switch,
+    ApplicationWindow, Box as GtkBox, Button, CheckButton, Label, ListBox, ListBoxRow, Orientation,
+    Overlay, PasswordEntry, Popover, ScrolledWindow, Switch,
 };
 use tr::tr;
 use tracing::debug;
@@ -376,16 +376,17 @@ pub struct NetworkCardState {
     pub password_box: RefCell<Option<GtkBox>>,
     pub password_label: RefCell<Option<Label>>,
     pub password_error_label: RefCell<Option<Label>>,
-    pub password_entry: RefCell<Option<Entry>>,
-    pub password_cancel_button: RefCell<Option<Button>>,
-    pub password_connect_button: RefCell<Option<Button>>,
+    pub password_entry: RefCell<Option<PasswordEntry>>,
+    /// "Save password", shown only for NM agent prompts on
+    /// profiles whose password NM won't keep (agent-owned secrets).
+    pub password_save_check: RefCell<Option<CheckButton>>,
+    /// NM secret agent request (id, SSID) shown in the password dialog.
+    pub nm_auth_request: RefCell<Option<(u64, String)>>,
     pub password_target_ssid: RefCell<Option<String>>,
     /// SSID that was connected when the password dialog was opened. Used to
     /// distinguish "user switched to a different network" from "user was already
     /// connected to something else when they opened the dialog."
     pub password_opened_ssid: RefCell<Option<String>>,
-    pub connect_anim_source: Rc<RefCell<Option<glib::SourceId>>>,
-    pub connect_anim_step: Cell<u8>,
     /// Prevents `state_set` handlers from dispatching during programmatic updates.
     pub updating_wifi_toggle: Cell<bool>,
     /// Same purpose as `updating_wifi_toggle` but scoped to the mobile switch.
@@ -418,12 +419,10 @@ impl NetworkCardState {
             password_label: RefCell::new(None),
             password_error_label: RefCell::new(None),
             password_entry: RefCell::new(None),
-            password_cancel_button: RefCell::new(None),
-            password_connect_button: RefCell::new(None),
+            password_save_check: RefCell::new(None),
+            nm_auth_request: RefCell::new(None),
             password_target_ssid: RefCell::new(None),
             password_opened_ssid: RefCell::new(None),
-            connect_anim_source: Rc::new(RefCell::new(None)),
-            connect_anim_step: Cell::new(0),
             updating_wifi_toggle: Cell::new(false),
             updating_mobile_switch: Cell::new(false),
             wifi_switch_row: RefCell::new(None),
@@ -452,11 +451,6 @@ impl ExpandableCard for NetworkCardState {
 
 impl Drop for NetworkCardState {
     fn drop(&mut self) {
-        // Cancel any active connect animation timer
-        if let Some(source_id) = self.connect_anim_source.borrow_mut().take() {
-            source_id.remove();
-            debug!("NetworkCardState: connect animation timer cancelled on drop");
-        }
         // Cancel any pending failed-state clear timers
         if let Some(source_id) = self.wifi_failed_clear_source.borrow_mut().take() {
             source_id.remove();
@@ -477,10 +471,7 @@ pub struct NetworkDetailsResult {
 
 /// Build the Wi-Fi details section with scan button, network list, and
 /// inline password prompt.
-pub fn build_wifi_details(
-    state: &Rc<NetworkCardState>,
-    window: WeakRef<ApplicationWindow>,
-) -> NetworkDetailsResult {
+pub fn build_wifi_details(state: &Rc<NetworkCardState>) -> NetworkDetailsResult {
     let container = GtkBox::new(Orientation::Vertical, 0);
 
     let snapshot = NetworkService::global().snapshot();
@@ -542,6 +533,12 @@ pub fn build_wifi_details(
     let scroller = ScrolledWindow::new();
     scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
     scroller.set_child(Some(&list_box));
+    // The list is rebuilt on every network update, which moves focus around;
+    // following it would make the list jump. Keyboard focus is followed in
+    // follow_keyboard_focus instead.
+    if let Some(viewport) = scroller.child().and_downcast::<gtk4::Viewport>() {
+        viewport.set_scroll_to_focus(false);
+    }
     scroller.set_max_content_height(360);
     scroller.set_propagate_natural_height(true);
 
@@ -555,9 +552,11 @@ pub fn build_wifi_details(
     pwd_label.set_xalign(0.0);
     pwd_box.append(&pwd_label);
 
-    let pwd_entry = Entry::new();
-    pwd_entry.set_visibility(false);
-    pwd_entry.set_input_purpose(gtk4::InputPurpose::Password);
+    // Same field as the polkit prompt: peek toggle, non-pageable buffer.
+    let pwd_entry = PasswordEntry::new();
+    pwd_entry.set_show_peek_icon(true);
+    // Undo history would copy a revealed password into unwiped memory.
+    pwd_entry.set_enable_undo(false);
     pwd_entry.set_can_focus(true);
     pwd_entry.set_focus_on_click(true);
 
@@ -571,22 +570,32 @@ pub fn build_wifi_details(
     }
     {
         let state_weak = Rc::downgrade(state);
-        let window_weak = window.clone();
         pwd_entry.connect_activate(move |_| {
             if let Some(state) = state_weak.upgrade() {
-                on_password_connect_clicked(&state, window_weak.clone());
+                on_password_connect_clicked(&state);
             }
         });
     }
 
     pwd_box.append(&pwd_entry);
 
+    let save_label = Label::new(Some(&tr!("Save password")));
+    save_label.set_xalign(0.0);
+    save_label.set_wrap(true);
+    let save_check = CheckButton::new();
+    save_check.add_css_class(qs::CHECK);
+    save_check.add_css_class(qs::PASSWORD_INDENT);
+    save_check.set_child(Some(&save_label));
+    save_check.set_visible(false);
+    pwd_box.append(&save_check);
+
     // Button row: [status label (expands)] [cancel] [connect]
     let btn_row = GtkBox::new(Orientation::Horizontal, 8);
 
-    // Status label (shows "Connecting..." or "Wrong password")
+    // Status label (shows "Wrong password" or "Connection failed")
     // Always visible but with empty text when idle - keeps buttons right-aligned
     let pwd_status_label = Label::new(Some(""));
+    pwd_status_label.add_css_class(qs::PASSWORD_INDENT);
     pwd_status_label.set_xalign(0.0);
     pwd_status_label.set_hexpand(true);
     btn_row.append(&pwd_status_label);
@@ -600,6 +609,7 @@ pub fn build_wifi_details(
     let style_mgr = SurfaceStyleManager::global();
     style_mgr.apply_pango_attrs(&pwd_label);
     style_mgr.apply_pango_attrs(&pwd_status_label);
+    style_mgr.apply_pango_attrs(&save_label);
 
     {
         let state_weak = Rc::downgrade(state);
@@ -612,10 +622,9 @@ pub fn build_wifi_details(
 
     {
         let state_weak = Rc::downgrade(state);
-        let window_weak = window.clone();
         btn_ok.connect_clicked(move |_| {
             if let Some(state) = state_weak.upgrade() {
-                on_password_connect_clicked(&state, window_weak.clone());
+                on_password_connect_clicked(&state);
             }
         });
     }
@@ -629,8 +638,7 @@ pub fn build_wifi_details(
     *state.password_label.borrow_mut() = Some(pwd_label.clone());
     *state.password_error_label.borrow_mut() = Some(pwd_status_label.clone());
     *state.password_entry.borrow_mut() = Some(pwd_entry.clone());
-    *state.password_cancel_button.borrow_mut() = Some(btn_cancel.clone());
-    *state.password_connect_button.borrow_mut() = Some(btn_ok.clone());
+    *state.password_save_check.borrow_mut() = Some(save_check);
 
     // Store switch references
     *state.wifi_switch_row.borrow_mut() = Some(wifi_switch_row);
@@ -646,6 +654,25 @@ pub fn build_wifi_details(
         scan_button,
         wifi_switch,
     }
+}
+
+/// Scroll the Wi-Fi list to keyboard-focused rows. Focus moved by the pointer,
+/// menus or a list rebuild isn't "focus visible", so it doesn't scroll.
+pub fn follow_keyboard_focus(window: &ApplicationWindow, list_box: &ListBox) {
+    let list_box = list_box.downgrade();
+    window.connect_focus_widget_notify(move |window| {
+        let (Some(list_box), Some(focus)) =
+            (list_box.upgrade(), gtk4::prelude::RootExt::focus(window))
+        else {
+            return;
+        };
+        if window.gets_focus_visible()
+            && focus.is_ancestor(&list_box)
+            && let Some(viewport) = list_box.parent().and_downcast::<gtk4::Viewport>()
+        {
+            viewport.scroll_to(&focus, None);
+        }
+    });
 }
 
 /// Build a standalone Ethernet section widget.
@@ -763,7 +790,7 @@ fn set_mobile_subtitle(widgets: &MobileRowWidgets, snapshot: &NetworkSnapshot) {
         accent_label.set_visible(false);
         details_label.set_visible(false);
     } else if snapshot.mobile_connecting() {
-        status_label.set_text(&tr!("Connecting..."));
+        status_label.set_text(&tr!("Connecting"));
         status_label.set_visible(true);
         status_label.remove_css_class(color::ERROR);
         status_label.add_css_class(color::MUTED);
@@ -1114,12 +1141,12 @@ pub fn populate_wifi_list(
         // Build subtitle parts (excluding "Connected" which gets special treatment)
         let mut extra_parts: Vec<String> = Vec::new();
         if is_connecting {
-            extra_parts.push(tr!("Connecting..."));
+            extra_parts.push(tr!("Connecting"));
         }
         if net.security.is_secured() {
             extra_parts.push(tr!("Secured"));
         }
-        // "Connecting..." already says enough; "Saved" is noise until the attempt settles.
+        // "Connecting" already says enough; "Saved" is noise until the attempt settles.
         if net.known && !is_connecting {
             extra_parts.push(tr!("Saved"));
         }
@@ -1179,10 +1206,7 @@ pub fn populate_wifi_list(
 
         // Create action widget with click handler (or placeholder if connecting)
         let right_widget = if is_connecting {
-            // Show a muted "Connecting..." label instead of action button
-            let connecting_label = Label::new(Some("..."));
-            connecting_label.add_css_class(color::MUTED);
-            connecting_label.upcast::<gtk4::Widget>()
+            create_connecting_action_widget()
         } else {
             let can_share = net.active && (!net.security.is_secured() || can_read_wifi_password);
             create_network_action_widget(net, can_share)
@@ -1251,6 +1275,7 @@ pub fn populate_wifi_list(
             && let Some(pwd_box) = state.password_box.borrow().as_ref()
         {
             let pwd_row = ListBoxRow::new();
+            pwd_row.add_css_class(qs::PASSWORD_ROW);
             pwd_row.set_activatable(false);
             pwd_row.set_focusable(false);
             pwd_box.set_visible(true);
@@ -1267,12 +1292,52 @@ pub fn populate_wifi_list(
         && let Some(pwd_box) = state.password_box.borrow().as_ref()
     {
         let pwd_row = ListBoxRow::new();
+        pwd_row.add_css_class(qs::PASSWORD_ROW);
         pwd_row.set_activatable(false);
         pwd_row.set_focusable(false);
         pwd_box.set_visible(true);
         pwd_row.set_child(Some(pwd_box));
         list_box.append(&pwd_row);
     }
+}
+
+/// Row menu for the network being connected: its only action is to cancel.
+fn create_connecting_action_widget() -> gtk4::Widget {
+    let (menu_btn, menu_icon) = create_row_menu_button();
+    let menu_icon_widget = menu_icon.widget();
+    menu_btn.connect_clicked(move |btn| {
+        let popover = Popover::new();
+        configure_popover(&popover);
+
+        let panel = GtkBox::new(Orientation::Vertical, 0);
+        panel.add_css_class(surface::POPOVER);
+        panel.add_css_class(surface::SURFACE_POPOVER);
+        panel.add_css_class(surface::WIDGET_MENU_CONTENT);
+
+        let content_box = GtkBox::new(Orientation::Vertical, 2);
+        content_box.add_css_class(qs::ROW_MENU_CONTENT);
+
+        let popover_weak = popover.downgrade();
+        let action = create_row_menu_action(&tr!("Cancel"), move || {
+            if let Some(p) = popover_weak.upgrade() {
+                close_row_menu_popover(&p);
+            }
+            // Same as the form's Cancel: an open prompt for this attempt
+            // (IWD keeps it open otherwise) is closed and wiped too.
+            match current_quick_settings_window() {
+                Some(qs) => on_password_cancel_clicked(&qs.network),
+                None => cancel_connection_attempt(),
+            }
+        });
+        content_box.append(&action);
+
+        panel.append(&content_box);
+        SurfaceStyleManager::global().apply_pango_attrs_all(&content_box);
+
+        popover.set_child(Some(&panel));
+        present_row_menu_popover(&popover, btn, &menu_icon_widget);
+    });
+    menu_btn.upcast()
 }
 
 /// Create the action widget for a network row.
@@ -1441,12 +1506,21 @@ pub fn show_password_dialog_with_error(
     }
 
     if let Some(entry) = state.password_entry.borrow().as_ref() {
-        entry.set_text("");
+        clear_password_entry(entry);
     }
+    set_password_save_offer(state, false, false);
 
     if let Some(list_box) = state.base.list_box.borrow().as_ref() {
         let snapshot = NetworkService::global().snapshot();
         populate_wifi_list(state, list_box, &snapshot);
+    }
+}
+
+/// Show or hide the "Save password" option, ticked as given.
+fn set_password_save_offer(state: &NetworkCardState, offer: bool, ticked: bool) {
+    if let Some(check) = state.password_save_check.borrow().as_ref() {
+        check.set_active(offer && ticked);
+        check.set_visible(offer);
     }
 }
 
@@ -1455,18 +1529,63 @@ pub fn show_password_dialog(state: &NetworkCardState, ssid: &str) {
     show_password_dialog_with_error(state, ssid, None);
 }
 
+/// Empty the field and hide a revealed password. Swapping the buffer wipes the
+/// field's copy; `set_text("")` would leave it in memory.
+fn clear_password_entry(entry: &PasswordEntry) {
+    if let Some(text) = entry.delegate().and_downcast::<gtk4::Text>() {
+        text.set_buffer(&gtk4::PasswordEntryBuffer::new());
+        text.set_visibility(false);
+    }
+}
+
 /// Called when the password entry is mapped; grabs focus if we have a target.
-fn on_password_entry_mapped(state: &NetworkCardState, entry: &Entry) {
+fn on_password_entry_mapped(state: &NetworkCardState, entry: &PasswordEntry) {
     if state.password_target_ssid.borrow().is_some() {
         entry.grab_focus();
+        // The list doesn't follow focus (see build_wifi_details), so bring the
+        // prompt into view; it may open outside the scrolled area.
+        if let Some(pwd_box) = state.password_box.borrow().as_ref() {
+            scroll_into_view_after_layout(pwd_box);
+        }
     }
+}
+
+/// Scroll `widget` into view once GTK has laid it out: a just-inserted widget
+/// still carries its previous (or no) position until then.
+fn scroll_into_view_after_layout(widget: &GtkBox) {
+    let Some(clock) = widget.frame_clock() else {
+        return;
+    };
+    let widget = widget.downgrade();
+    let handler: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::default();
+    let id = clock.connect_layout({
+        let handler = Rc::clone(&handler);
+        move |clock| {
+            if let Some(id) = handler.borrow_mut().take() {
+                clock.disconnect(id);
+            }
+            if let Some(widget) = widget.upgrade()
+                && let Some(viewport) = widget
+                    .ancestor(gtk4::Viewport::static_type())
+                    .and_downcast::<gtk4::Viewport>()
+            {
+                viewport.scroll_to(&widget, None);
+            }
+        }
+    });
+    *handler.borrow_mut() = Some(id);
+    clock.request_phase(gtk4::gdk::FrameClockPhase::LAYOUT);
 }
 
 /// Cancel the inline password prompt.
 fn on_password_cancel_clicked(state: &NetworkCardState) {
     hide_password_dialog(state);
+    cancel_connection_attempt();
+}
 
-    // Cancel any pending IWD auth, abort active connection, and clear failed state
+/// Cancel any pending agent auth, abort an active connection attempt, and
+/// clear the failed state.
+fn cancel_connection_attempt() {
     let service = NetworkService::global();
     service.cancel_auth();
     if service.snapshot().connection_state() == NetworkConnectionState::Connecting {
@@ -1505,18 +1624,24 @@ fn schedule_failed_clear_after<F: FnOnce() + 'static>(
 /// Hide the password dialog and reset its state.
 pub(super) fn hide_password_dialog(state: &NetworkCardState) {
     if let Some(entry) = state.password_entry.borrow().as_ref() {
-        entry.set_text("");
+        clear_password_entry(entry);
     }
     if let Some(box_) = state.password_box.borrow().as_ref() {
+        // Otherwise GTK hands focus to the next row control, with a focus ring
+        // if the password was typed.
+        if let Some(root) = box_.root()
+            && root.focus().is_some_and(|focus| focus.is_ancestor(box_))
+        {
+            root.set_focus(None::<&gtk4::Widget>);
+        }
         box_.set_visible(false);
     }
-    // Reset connecting state (re-enable inputs, stop animation)
-    set_password_connecting_state(state, false, None);
     // Clear status label
     if let Some(error_label) = state.password_error_label.borrow().as_ref() {
         error_label.remove_css_class(color::ERROR);
         error_label.set_label("");
     }
+    set_password_save_offer(state, false, false);
     *state.password_target_ssid.borrow_mut() = None;
     *state.password_opened_ssid.borrow_mut() = None;
 
@@ -1526,8 +1651,10 @@ pub(super) fn hide_password_dialog(state: &NetworkCardState) {
     }
 }
 
-/// Attempt to connect using the inline password prompt.
-fn on_password_connect_clicked(state: &NetworkCardState, window: WeakRef<ApplicationWindow>) {
+/// Submit the inline password prompt. The dialog closes right away: the
+/// network's row shows progress, and a wrong password reopens the dialog with
+/// an error (NM asks its agent again; IWD reports an auth failure).
+fn on_password_connect_clicked(state: &NetworkCardState) {
     let ssid_opt = state.password_target_ssid.borrow().clone();
     let Some(ssid) = ssid_opt else {
         return;
@@ -1539,12 +1666,17 @@ fn on_password_connect_clicked(state: &NetworkCardState, window: WeakRef<Applica
         String::new()
     };
 
-    if ssid.is_empty() {
+    if ssid.is_empty() || password.is_empty() {
         return;
     }
 
-    // Show connecting state: disable inputs, start animation
-    set_password_connecting_state(state, true, Some(window));
+    let save = state
+        .password_save_check
+        .borrow()
+        .as_ref()
+        .is_some_and(|check| check.is_visible() && check.is_active());
+
+    hide_password_dialog(state);
 
     let service = NetworkService::global();
     let snapshot = service.snapshot();
@@ -1562,13 +1694,13 @@ fn on_password_connect_clicked(state: &NetworkCardState, window: WeakRef<Applica
             .and_then(|network| network.path.clone()),
     };
 
-    // Check if this is an IWD auth request (agent callback pending)
+    // Check if the backend's agent is waiting for this password.
     // Verify the auth request SSID matches our target to avoid submitting
     // a password for the wrong network in case of a race.
     if let Some(auth_ssid) = snapshot.auth_request_ssid() {
         if auth_ssid == ssid {
-            // IWD agent pattern: submit the password to the pending D-Bus invocation
-            service.submit_password(&password);
+            // Agent pattern: submit the password to the pending D-Bus invocation
+            service.submit_password(&password, save);
         } else {
             // SSID mismatch — the pending auth is for a different network.
             // Connect directly instead (this will trigger a new auth flow).
@@ -1579,82 +1711,8 @@ fn on_password_connect_clicked(state: &NetworkCardState, window: WeakRef<Applica
             service.connect_to_network(&ssid, Some(&password), path.as_deref());
         }
     } else {
-        // No pending IWD auth request — connect with password directly.
+        // No pending auth request — connect with password directly.
         service.connect_to_network(&ssid, Some(&password), path.as_deref());
-    }
-}
-
-/// Set the password dialog to connecting/idle state.
-/// When `connecting` is true, `window` must be provided to start the animation.
-/// When `connecting` is false, `window` can be None as we're just stopping.
-fn set_password_connecting_state(
-    state: &NetworkCardState,
-    connecting: bool,
-    window: Option<WeakRef<ApplicationWindow>>,
-) {
-    if let Some(entry) = state.password_entry.borrow().as_ref() {
-        entry.set_sensitive(!connecting);
-    }
-    // Cancel button stays enabled during connect so the user can abort.
-    if !connecting && let Some(btn) = state.password_cancel_button.borrow().as_ref() {
-        btn.set_sensitive(true);
-    }
-    if let Some(btn) = state.password_connect_button.borrow().as_ref() {
-        btn.set_sensitive(!connecting);
-    }
-
-    // Show "Connecting..." animation in the status label (same location as error)
-    let mut source_opt = state.connect_anim_source.borrow_mut();
-    if connecting {
-        // Show status label with initial text (remove error styling)
-        if let Some(label) = state.password_error_label.borrow().as_ref() {
-            label.remove_css_class(color::ERROR);
-            label.set_label(&tr!("Connecting"));
-        }
-
-        if source_opt.is_none()
-            && let Some(window) = window
-        {
-            // Start a simple dot animation: "Connecting", "Connecting.", ...
-            let step_cell = state.connect_anim_step.clone();
-            let source_for_callback = Rc::clone(&state.connect_anim_source);
-            let source_id = glib::timeout_add_local(Duration::from_millis(450), {
-                move || {
-                    if let Some(window) = window.upgrade()
-                        && let Some(qs) = super::window::get_qs_window_data(&window)
-                        && let Some(label) = qs.network.password_error_label.borrow().as_ref()
-                    {
-                        let step = step_cell.get().wrapping_add(1) % 4;
-                        step_cell.set(step);
-                        let dots = match step {
-                            1 => ".",
-                            2 => "..",
-                            3 => "...",
-                            _ => "",
-                        };
-                        label.set_label(&format!("{}{dots}", tr!("Connecting")));
-                        glib::ControlFlow::Continue
-                    } else {
-                        // Returning Break removes this source. Clear the stored ID
-                        // first so teardown cannot attempt to remove it again.
-                        source_for_callback.borrow_mut().take();
-                        glib::ControlFlow::Break
-                    }
-                }
-            });
-            *source_opt = Some(source_id);
-        }
-    } else {
-        // Stop animation if running
-        if let Some(id) = source_opt.take() {
-            id.remove();
-            state.connect_anim_step.set(0);
-        }
-        // Clear status label (will be set to error text by caller if needed)
-        if let Some(label) = state.password_error_label.borrow().as_ref() {
-            label.remove_css_class(color::ERROR);
-            label.set_label("");
-        }
     }
 }
 
@@ -1690,29 +1748,56 @@ pub fn on_network_changed(
     snapshot: &NetworkSnapshot,
     window: &ApplicationWindow,
 ) {
-    // Backend-specific: NM provides the password upfront and tracks connection
+    // Backend-specific: NM takes the password upfront for new profiles, asks via
+    // its secret agent when a saved profile has none, and tracks connection
     // failure via failed_ssid. This block handles the NM password dialog lifecycle
-    // (error display, success dismiss, stale dialog cleanup). Cannot be unified with
-    // the IWD block below because NM has no agent-based auth flow.
+    // (agent prompts, error display, success dismiss, stale dialog cleanup). Kept
+    // separate from the IWD block below because their failure reporting differs.
     if let NetworkSnapshot::NetworkManager(nm_snap) = snapshot {
+        match &nm_snap.wifi.auth_request {
+            // Unmapped: show_panel()'s idle callback re-delivers the snapshot
+            // after mapping; the agent's timeout is the backstop.
+            Some(request)
+                if state.nm_auth_request.borrow().as_ref().map(|(id, _)| *id)
+                    != Some(request.id)
+                    && window.is_mapped() =>
+            {
+                debug!(
+                    "NM requesting password for '{}' (retry={}), showing password dialog",
+                    request.ssid, request.is_retry
+                );
+                state
+                    .nm_auth_request
+                    .replace(Some((request.id, request.ssid.clone())));
+                show_password_dialog_with_error(
+                    state,
+                    &request.ssid,
+                    request.is_retry.then_some(AUTH_FAILURE_REASON),
+                );
+                set_password_save_offer(state, request.offer_save, request.save_ticked);
+            }
+            Some(_) => {}
+            None => {
+                // The request ended unanswered (timeout, attempt gone): its form
+                // could no longer deliver a password, so close it.
+                let ended = state.nm_auth_request.take();
+                let showing_ended = ended.is_some_and(|(_, ssid)| {
+                    state.password_target_ssid.borrow().as_deref() == Some(ssid.as_str())
+                });
+                if showing_ended {
+                    hide_password_dialog(state);
+                }
+            }
+        }
+
         let current_target = state.password_target_ssid.borrow().clone();
         if let Some(ref target_ssid) = current_target {
-            let connecting = nm_snap.wifi.connecting_ssid.as_ref() == Some(target_ssid);
-            // Only update on transitions so later snapshots preserve failure text.
-            if connecting != state.connect_anim_source.borrow().is_some() {
-                set_password_connecting_state(
-                    state,
-                    connecting,
-                    connecting.then(|| window.downgrade()),
-                );
-            }
             if !nm_snap.available || nm_snap.wifi.enabled == Some(false) {
                 hide_password_dialog(state);
             } else if let Some(ref failed_ssid) = nm_snap.wifi.failed_ssid {
                 if failed_ssid == target_ssid {
-                    // Connection failed for our target - show error and re-enable form
+                    // Connection failed for our target - show the error in the form
                     debug!("Connection failed for '{}', showing error", failed_ssid);
-                    set_password_connecting_state(state, false, None);
                     if let Some(error_label) = state.password_error_label.borrow().as_ref() {
                         error_label.add_css_class(color::ERROR);
                         error_label.set_label(&tr!("Connection failed"));
@@ -1800,7 +1885,7 @@ pub fn on_network_changed(
         if let Some(ref target_ssid) = current_target {
             if let Some(ref failed_ssid) = iwd_snap.failed_ssid {
                 if failed_ssid == target_ssid {
-                    // Connection failed for our target - show error and re-enable form
+                    // Connection failed for our target - show the error in the form
                     let reason = iwd_snap
                         .failed_reason
                         .as_deref()
@@ -1809,7 +1894,6 @@ pub fn on_network_changed(
                         "IWD connection failed for '{}': {}, showing error",
                         failed_ssid, reason
                     );
-                    set_password_connecting_state(state, false, None);
                     if let Some(error_label) = state.password_error_label.borrow().as_ref() {
                         error_label.add_css_class(color::ERROR);
                         error_label.set_label(&failure_text(reason));
@@ -2252,6 +2336,7 @@ mod tests {
                 networks: Vec::new(),
                 connecting_ssid: None,
                 failed_ssid: None,
+                auth_request: None,
                 device_state: None,
             },
             wired: WiredState {

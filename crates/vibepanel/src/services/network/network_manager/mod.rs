@@ -7,12 +7,12 @@
 //! - [`wired`] — Ethernet device info fetching
 //! - [`mobile`] — ModemManager integration, cellular connect/disconnect
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gtk4::gio::{self, prelude::*};
 use gtk4::glib::{self, Variant};
@@ -20,6 +20,8 @@ use tracing::{debug, error};
 
 use crate::services::callbacks::{CallbackId, Callbacks};
 use crate::services::network::{WifiNetwork, objpath_to_string};
+use crate::services::nm_secret_agent::NmSecretAgent;
+pub use crate::services::nm_secret_agent::WifiAuthRequest;
 use crate::services::sleep_watcher::SleepWatcher;
 
 mod mobile;
@@ -50,6 +52,10 @@ const OBJECT_MANAGER_IFACE: &str = "org.freedesktop.DBus.ObjectManager";
 const MM_MODEM_IFACE: &str = "org.freedesktop.ModemManager1.Modem";
 const MM_MODEM_3GPP_IFACE: &str = "org.freedesktop.ModemManager1.Modem.Modem3gpp";
 const PROPERTIES_IFACE: &str = "org.freedesktop.DBus.Properties";
+
+/// Longest a connected network's row stays "Connecting" waiting for the device
+/// to report it.
+const WIFI_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Debounce interval for mobile info refreshes triggered by ModemManager signals.
 const MOBILE_REFRESH_DEBOUNCE_MS: u64 = 75;
@@ -112,6 +118,8 @@ pub struct WifiState {
     pub connecting_ssid: Option<String>,
     /// SSID that failed to connect.
     pub failed_ssid: Option<String>,
+    /// NM asked our secret agent for the password of the network being connected.
+    pub auth_request: Option<Rc<WifiAuthRequest>>,
     /// NM Device `State` property (e.g., 40=PREPARE … 90=SECONDARIES → connecting).
     pub device_state: Option<u32>,
 }
@@ -229,12 +237,16 @@ enum NmUpdate {
         last_scan: Option<i64>,
     },
     RefreshNetworks,
+    WifiAuthRequested(WifiAuthRequest),
+    WifiAuthCleared {
+        id: u64,
+    },
     ConnectionAttemptFinished {
         attempt: u64,
         ssid: String,
         success: bool,
-        /// Set only when activation succeeded but the profile could not be saved.
-        message: Option<String>,
+        /// Set only when activation succeeded but saving failed: (title, error).
+        save_failure: Option<(&'static str, String)>,
     },
     WiredDeviceInfo {
         iface_name: Option<String>,
@@ -309,6 +321,21 @@ pub(super) struct WifiInternal {
     pub(super) known_ssids_last_refresh: Arc<Mutex<Option<Instant>>>,
     pub(super) connecting_ssid: RefCell<Option<String>>,
     pub(super) failed_ssid: RefCell<Option<String>>,
+    /// Prompted secret the user chose to save, written to the profile once
+    /// the attempt it was entered for connects.
+    pub(super) secret_to_save: RefCell<Option<PromptedSecret>>,
+    /// Attempt NM reported activated while the device doesn't show it connected
+    /// yet; its row stays "Connecting" until it does.
+    pub(super) settling_attempt: Cell<Option<u64>>,
+    /// Deadline of the current activation, pushed back while a prompt is open.
+    activation_deadline: RefCell<Option<wifi::ActivationDeadline>>,
+}
+
+/// A password entered at an agent prompt, kept until its attempt finishes.
+pub(super) struct PromptedSecret {
+    pub(super) attempt: u64,
+    pub(super) request: WifiAuthRequest,
+    pub(super) secret: String,
 }
 
 impl WifiInternal {
@@ -327,11 +354,18 @@ impl WifiInternal {
             known_ssids_last_refresh: Arc::new(Mutex::new(None)),
             connecting_ssid: RefCell::new(None),
             failed_ssid: RefCell::new(None),
+            secret_to_save: RefCell::new(None),
+            activation_deadline: RefCell::new(None),
+            settling_attempt: Cell::new(None),
         }
     }
 }
 
 // ── NmService ────────────────────────────────────────────────────────
+
+thread_local! {
+    static INSTANCE: OnceCell<Rc<NmService>> = const { OnceCell::new() };
+}
 
 /// Shared, process-wide network service for Wi-Fi, Ethernet, and mobile state and control.
 pub struct NmService {
@@ -370,11 +404,12 @@ impl NmService {
 
     /// Get the global NmService singleton.
     pub fn global() -> Rc<Self> {
-        thread_local! {
-            static INSTANCE: Rc<NmService> = NmService::new();
-        }
+        INSTANCE.with(|s| s.get_or_init(NmService::new).clone())
+    }
 
-        INSTANCE.with(|s| s.clone())
+    /// SSID the panel is currently activating, without creating the service.
+    pub(crate) fn connecting_wifi_ssid() -> Option<String> {
+        INSTANCE.with(|s| s.get()?.wifi.connecting_ssid.borrow().clone())
     }
 
     /// Register a callback to be invoked whenever the network state changes.
@@ -507,25 +542,62 @@ impl NmService {
             NmUpdate::RefreshNetworks => {
                 self.refresh_networks_async();
             }
+            NmUpdate::WifiAuthRequested(mut request) => {
+                // The attempt may have been replaced while this update was queued.
+                if self.wifi.connecting_ssid.borrow().as_deref() != Some(request.ssid.as_str()) {
+                    NmSecretAgent::cancel_wifi_auth(request.id);
+                    return;
+                }
+                // The agent's own timeout, not the activation's, ends an open prompt.
+                self.extend_wifi_activation(
+                    crate::services::nm_secret_agent::AUTH_TIMEOUT + Duration::from_secs(5),
+                );
+                // A retry within the attempt keeps its "Save password" choice.
+                request.save_ticked =
+                    self.wifi
+                        .secret_to_save
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|prompted| {
+                            prompted.attempt == self.wifi.attempt.get()
+                                && prompted.request.ssid == request.ssid
+                        });
+                self.notify_snapshot(|s| s.wifi.auth_request = Some(Rc::new(request)));
+            }
+            NmUpdate::WifiAuthCleared { id } => {
+                self.notify_snapshot_if(|s| {
+                    let matches = s.wifi.auth_request.as_ref().is_some_and(|r| r.id == id);
+                    if matches {
+                        s.wifi.auth_request = None;
+                    }
+                    matches
+                });
+            }
             NmUpdate::ConnectionAttemptFinished {
                 attempt,
                 ssid,
                 success,
-                message,
+                save_failure,
             } => {
                 if self.wifi.attempt.get() != attempt {
                     return;
                 }
-                *self.wifi.connecting_ssid.borrow_mut() = None;
+                if success {
+                    // Device properties trail the activation result; keep the row
+                    // "Connecting" until they catch up (see reconcile_wifi_state).
+                    self.wifi.settling_attempt.set(Some(attempt));
+                } else {
+                    *self.wifi.connecting_ssid.borrow_mut() = None;
+                }
                 *self
                     .wifi
                     .known_ssids_last_refresh
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = None;
-                if let Some(message) = message {
+                if let Some((title, error)) = save_failure {
                     crate::services::desktop_notification::send_with_id(
-                        "Wi-Fi connected, but could not save network",
-                        &glib::markup_escape_text(&message),
+                        title,
+                        &glib::markup_escape_text(&error),
                         "network-wireless",
                         crate::services::desktop_notification::Urgency::Normal,
                         false,
@@ -541,10 +613,22 @@ impl NmService {
                 }
 
                 let failed_ssid = self.wifi.failed_ssid.borrow().clone();
+                let connecting_ssid = self.wifi.connecting_ssid.borrow().clone();
                 self.notify_snapshot(|s| {
-                    s.wifi.connecting_ssid = None;
+                    s.wifi.connecting_ssid = connecting_ssid;
                     s.wifi.failed_ssid = failed_ssid;
                 });
+
+                // If the device never reports the network (e.g. reading its access
+                // points fails), don't leave the row "Connecting" forever.
+                if self.wifi.settling_attempt.get() == Some(attempt) {
+                    glib::timeout_add_local_once(WIFI_SETTLE_TIMEOUT, move || {
+                        let this = NmService::global();
+                        if this.wifi.settling_attempt.get() == Some(attempt) {
+                            this.notify_snapshot(|s| this.finish_settling(&mut s.wifi));
+                        }
+                    });
+                }
 
                 self.refresh_networks_async();
             }
@@ -727,6 +811,8 @@ impl NmService {
                         }
                     },
                 );
+
+                NmSecretAgent::register(&connection);
 
                 // Refresh mobile state after resume from suspend/hibernate.
                 // NmService is a process-lifetime singleton; the callback intentionally
@@ -1068,6 +1154,14 @@ impl NmService {
             drop(snapshot);
         }
     }
+}
+
+pub(crate) fn wifi_auth_requested(request: WifiAuthRequest) {
+    send_nm_update(NmUpdate::WifiAuthRequested(request));
+}
+
+pub(crate) fn wifi_auth_cleared(id: u64) {
+    send_nm_update(NmUpdate::WifiAuthCleared { id });
 }
 
 /// Send an update from a background thread to the main GLib loop.

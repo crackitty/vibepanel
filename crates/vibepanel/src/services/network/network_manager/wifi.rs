@@ -11,12 +11,13 @@ use gtk4::glib::{self, Variant, VariantTy};
 use tracing::{debug, error, warn};
 
 use super::{
-    IFACE_AP, IFACE_DEV, IFACE_WIFI, NM_IFACE, NM_SERVICE, NmService, NmUpdate, send_nm_update,
-    system_dbus_proxy_sync,
+    IFACE_AP, IFACE_DEV, IFACE_WIFI, NM_IFACE, NM_SERVICE, NmService, NmUpdate, PromptedSecret,
+    WifiAuthRequest, send_nm_update, system_dbus_proxy_sync,
 };
 use crate::services::network::{
     SecurityType, WifiAuthentication, WifiCredentials, WifiNetwork, objpath_to_string,
 };
+use crate::services::nm_secret_agent::NmSecretAgent;
 
 impl NmService {
     pub fn request_active_wifi_credentials<F>(&self, callback: F)
@@ -261,9 +262,21 @@ impl NmService {
             active_ap.as_deref(),
             &self.wifi.networks.borrow(),
         );
+        if self.wifi.settling_attempt.get().is_some() && !device_catching_up(state) {
+            self.finish_settling(state);
+        }
         // Mark active APs before deduplication so a weaker connected AP keeps its row.
-        state.networks =
-            Self::sort_networks(Self::dedupe_networks(std::mem::take(&mut state.networks)));
+        state.networks = Self::sort_networks(
+            Self::dedupe_networks(std::mem::take(&mut state.networks)),
+            state.connecting_ssid.as_deref(),
+        );
+    }
+
+    /// End the gap between "attempt activated" and "device shows it connected".
+    pub(super) fn finish_settling(&self, state: &mut super::WifiState) {
+        self.wifi.settling_attempt.set(None);
+        self.wifi.connecting_ssid.replace(None);
+        state.connecting_ssid = None;
     }
 
     // Network List Refresh
@@ -622,26 +635,21 @@ impl NmService {
         merged.into_values().collect()
     }
 
-    fn sort_networks(mut networks: Vec<WifiNetwork>) -> Vec<WifiNetwork> {
+    fn sort_networks(mut networks: Vec<WifiNetwork>, connecting: Option<&str>) -> Vec<WifiNetwork> {
+        // Group: 0 = active or connecting (so the row keeps its place from
+        // "Connecting" to "Connected"), 1 = known, 2 = other
+        let group = |network: &WifiNetwork| {
+            if network.active || connecting == Some(network.ssid.as_str()) {
+                0
+            } else if network.known {
+                1
+            } else {
+                2
+            }
+        };
         networks.sort_by(|a, b| {
-            // Group: 0 = active, 1 = known, 2 = other
-            let group_a = if a.active {
-                0
-            } else if a.known {
-                1
-            } else {
-                2
-            };
-            let group_b = if b.active {
-                0
-            } else if b.known {
-                1
-            } else {
-                2
-            };
-
-            group_a
-                .cmp(&group_b)
+            group(a)
+                .cmp(&group(b))
                 .then_with(|| b.strength.cmp(&a.strength)) // Descending strength
                 .then_with(|| a.ssid.cmp(&b.ssid))
         });
@@ -762,6 +770,10 @@ impl NmService {
 
         let password = password.map(|s| s.to_string());
         let ap = ap.map(str::to_string);
+        let deadline = ActivationDeadline::after(WIFI_ACTIVATION_TIMEOUT);
+        self.wifi
+            .activation_deadline
+            .replace(Some(deadline.clone()));
 
         let this = self.clone();
         let task = glib::spawn_future_local(async move {
@@ -786,14 +798,14 @@ impl NmService {
                 )
             };
             let result = Self::activate_wifi(
-                call,
+                &call,
                 |active| {
                     wait_activation(
                         bus.clone(),
                         owner.to_string(),
                         active.to_string(),
                         cancel.clone(),
-                        Duration::from_secs(90),
+                        deadline.clone(),
                     )
                 },
                 &device_path,
@@ -803,7 +815,45 @@ impl NmService {
                 &cancel,
             )
             .await;
-            let (success, message) = match result {
+            // Don't keep this attempt's password past its end; leave a newer attempt's.
+            let prompted = {
+                let mut slot = this.wifi.secret_to_save.borrow_mut();
+                if slot
+                    .as_ref()
+                    .is_some_and(|prompted| prompted.attempt == attempt)
+                {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            let result = match result {
+                Ok(save_error) => {
+                    let save_error =
+                        save_error.map(|e| ("Wi-Fi connected, but could not save network", e));
+                    match prompted {
+                        Some(prompted) if !cancel.is_cancelled() => {
+                            let saved = Self::save_prompted_secret(
+                                &call,
+                                &prompted.request,
+                                &prompted.secret,
+                                &cancel,
+                            )
+                            .await;
+                            if let Err(e) = &saved {
+                                warn!("Connected to '{ssid}', but saving the password failed: {e}");
+                            }
+                            Ok(saved
+                                .err()
+                                .map(|e| ("Wi-Fi connected, but could not save password", e))
+                                .or(save_error))
+                        }
+                        _ => Ok(save_error),
+                    }
+                }
+                Err(e) => Err(e),
+            };
+            let (success, save_failure) = match result {
                 Ok(save_error) => (true, save_error),
                 Err(e) => {
                     warn!("Wi-Fi activation failed for '{ssid}': {e}");
@@ -814,7 +864,7 @@ impl NmService {
                 attempt,
                 ssid,
                 success,
-                message,
+                save_failure,
             });
         });
         self.wifi.activation_task.replace(Some(task));
@@ -826,6 +876,85 @@ impl NmService {
         if let Some(cancel) = self.wifi.activation_cancel.take() {
             cancel.cancel();
         }
+        self.wifi.secret_to_save.take();
+        self.wifi.settling_attempt.set(None);
+        self.cancel_wifi_auth();
+    }
+
+    /// Answer the agent's pending password prompt. With `save`, the password is
+    /// stored in the profile once the connection succeeds (only offered for
+    /// agent-owned secrets, which NM would otherwise forget).
+    pub fn submit_wifi_secret(&self, secret: &str, save: bool) {
+        let Some(request) = self.snapshot.borrow().wifi.auth_request.clone() else {
+            return;
+        };
+        let prompted = (save && request.offer_save).then(|| PromptedSecret {
+            attempt: self.wifi.attempt.get(),
+            request: WifiAuthRequest::clone(&request),
+            secret: secret.to_string(),
+        });
+        if NmSecretAgent::submit_wifi_secret(&request, secret) {
+            self.wifi.secret_to_save.replace(prompted);
+            self.extend_wifi_activation(WIFI_ACTIVATION_TIMEOUT);
+        }
+    }
+
+    /// Don't count time spent on a password prompt against the activation.
+    pub(super) fn extend_wifi_activation(&self, timeout: Duration) {
+        if let Some(deadline) = self.wifi.activation_deadline.borrow().as_ref() {
+            deadline.extend(timeout);
+        }
+    }
+
+    /// Decline the agent's pending password prompt.
+    pub fn cancel_wifi_auth(&self) {
+        let auth_id = self
+            .snapshot
+            .borrow()
+            .wifi
+            .auth_request
+            .as_ref()
+            .map(|r| r.id);
+        if let Some(id) = auth_id {
+            NmSecretAgent::cancel_wifi_auth(id);
+        }
+    }
+
+    /// Store a prompted secret in its profile as NM-owned (`*-flags` 0).
+    async fn save_prompted_secret<F>(
+        raw_call: impl Fn(&str, &str, &str, Option<&Variant>) -> F,
+        request: &WifiAuthRequest,
+        secret: &str,
+        cancel: &gio::Cancellable,
+    ) -> Result<(), String>
+    where
+        F: std::future::Future<Output = Result<Variant, glib::Error>>,
+    {
+        let path = request.connection_path.as_str();
+        let settings: HashMap<String, HashMap<String, Variant>> =
+            raw_call(path, super::IFACE_SETTINGS_CONN, "GetSettings", None)
+                .await
+                .map_err(|e| format!("GetSettings: {e}"))?
+                .child_value(0)
+                .get()
+                .ok_or("Invalid settings reply")?;
+        // Cancelled while reading: the user no longer wants this attempt.
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        let settings = with_saved_secret(settings, request, secret);
+        let args: HashMap<String, Variant> = HashMap::new();
+        // Update2 replaces the settings; flags 0 keep the profile's storage
+        // (a temporary profile stays in memory).
+        raw_call(
+            path,
+            super::IFACE_SETTINGS_CONN,
+            "Update2",
+            Some(&(settings, 0u32, args).to_variant()),
+        )
+        .await
+        .map_err(|e| format!("Update2: {e}"))?;
+        Ok(())
     }
 
     pub(super) fn cancel_wifi_attempt(&self) {
@@ -1074,12 +1203,34 @@ impl NmService {
     }
 }
 
+/// How long a Wi-Fi activation may take, restarted while the user answers a password prompt.
+pub(super) const WIFI_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Activation deadline the caller can push back, e.g. while the user types a password.
+#[derive(Clone)]
+pub(super) struct ActivationDeadline(Rc<std::cell::Cell<Instant>>);
+
+impl ActivationDeadline {
+    pub(super) fn after(timeout: Duration) -> Self {
+        Self(Rc::new(std::cell::Cell::new(Instant::now() + timeout)))
+    }
+
+    /// Allow at least `timeout` more from now.
+    pub(super) fn extend(&self, timeout: Duration) {
+        self.0.set(self.0.get().max(Instant::now() + timeout));
+    }
+
+    fn remaining(&self) -> Duration {
+        self.0.get().saturating_duration_since(Instant::now())
+    }
+}
+
 pub(super) async fn wait_activation(
     bus: gio::DBusConnection,
     owner: String,
     active: String,
     cancel: gio::Cancellable,
-    timeout: Duration,
+    deadline: ActivationDeadline,
 ) -> Result<(), String> {
     let (sender, receiver) = async_channel::unbounded::<Result<u32, String>>();
     let saw_signal = Rc::new(std::cell::Cell::new(false));
@@ -1141,12 +1292,15 @@ pub(super) async fn wait_activation(
             }
         },
     );
-    let result = glib::future_with_timeout(timeout, async {
+    let result = async {
         loop {
-            let mut event = receiver
-                .recv()
-                .await
-                .map_err(|_| "Activation watcher closed".to_string())?;
+            let mut event =
+                match glib::future_with_timeout(deadline.remaining(), receiver.recv()).await {
+                    Ok(event) => event.map_err(|_| "Activation watcher closed".to_string())?,
+                    // Pushed back while we waited.
+                    Err(_) if !deadline.remaining().is_zero() => continue,
+                    Err(_) => return Err("Connection activation timed out".into()),
+                };
             // Prefer the latest queued state if activation and deactivation arrived together,
             // but never let a state overwrite a queued terminal error (cancel or bus closure).
             while event.is_ok()
@@ -1161,15 +1315,36 @@ pub(super) async fn wait_activation(
                 _ => return Err("Invalid connection activation state".into()),
             }
         }
-    })
-    .await
-    .unwrap_or_else(|_| Err("Connection activation timed out".into()));
+    }
+    .await;
     read_cancel.cancel();
     if let Some(id) = cancelled {
         cancel.disconnect_cancelled(id);
     }
     bus.disconnect(closed);
     result
+}
+
+/// After NM reports an attempt activated, whether the device's own properties
+/// still lag: it reports connecting, or connected without its AP's row yet.
+/// Anything else (connected, disconnected, Wi-Fi off) ends "Connecting".
+fn device_catching_up(state: &super::WifiState) -> bool {
+    matches!(state.device_state, Some(40..=90))
+        || (state.device_state == Some(100) && state.ssid.is_none())
+}
+
+/// Add `secret` to the profile's settings and mark it NM-owned.
+fn with_saved_secret(
+    mut settings: HashMap<String, HashMap<String, Variant>>,
+    request: &WifiAuthRequest,
+    secret: &str,
+) -> HashMap<String, HashMap<String, Variant>> {
+    let security = settings
+        .entry("802-11-wireless-security".to_string())
+        .or_default();
+    security.insert(request.secret_key.clone(), secret.to_variant());
+    security.insert(request.flags_key.clone(), 0u32.to_variant());
+    settings
 }
 
 fn new_wifi_settings(
@@ -1347,7 +1522,7 @@ mod tests {
             attempt: 1,
             ssid: "old attempt".into(),
             success: true,
-            message: None,
+            save_failure: None,
         });
         assert_eq!(
             service.snapshot().wifi.connecting_ssid.as_deref(),
@@ -1357,12 +1532,98 @@ mod tests {
             attempt: 2,
             ssid: "new attempt".into(),
             success: false,
-            message: None,
+            save_failure: None,
         });
         let snapshot = service.snapshot();
         assert!(snapshot.wifi.connecting_ssid.is_none());
         assert_eq!(snapshot.wifi.failed_ssid.as_deref(), Some("new attempt"));
         assert!(!snapshot.wifi.connected && snapshot.wifi.networks.iter().all(|n| !n.active));
+    }
+
+    #[test]
+    fn connecting_network_keeps_its_place_until_connected() {
+        let network = |ssid: &str, strength: i32| WifiNetwork {
+            ssid: ssid.into(),
+            strength,
+            active: false,
+            ..test_network(&format!("/{ssid}"))
+        };
+        let sorted = NmService::sort_networks(
+            vec![network("home", 75), network("hotspot", 40)],
+            Some("hotspot"),
+        );
+        assert_eq!(sorted[0].ssid, "hotspot");
+        let sorted =
+            NmService::sort_networks(vec![network("home", 75), network("hotspot", 40)], None);
+        assert_eq!(sorted[0].ssid, "home");
+
+        let state = |device_state, ssid: Option<&str>| super::super::WifiState {
+            device_state,
+            ssid: ssid.map(str::to_string),
+            ..Default::default()
+        };
+        assert!(device_catching_up(&state(Some(70), None)));
+        assert!(device_catching_up(&state(Some(100), None)));
+        assert!(!device_catching_up(&state(Some(100), Some("hotspot"))));
+        assert!(!device_catching_up(&state(Some(30), None)));
+        assert!(!device_catching_up(&state(None, None)));
+
+        // Without device state the attempt's result applies at once.
+        let service = test_service();
+        service.wifi.connecting_ssid.replace(Some("hotspot".into()));
+        service.apply_update(NmUpdate::ConnectionAttemptFinished {
+            attempt: 0,
+            ssid: "hotspot".into(),
+            success: true,
+            save_failure: None,
+        });
+        assert!(service.snapshot().wifi.connecting_ssid.is_none());
+        assert!(service.wifi.settling_attempt.get().is_none());
+    }
+
+    #[test]
+    fn prompts_push_the_activation_deadline_back() {
+        let service = test_service();
+        let request = prompt_request("psk", "psk-flags");
+        service
+            .wifi
+            .connecting_ssid
+            .replace(Some(request.ssid.clone()));
+        let deadline = ActivationDeadline::after(Duration::ZERO);
+        service
+            .wifi
+            .activation_deadline
+            .replace(Some(deadline.clone()));
+        service.apply_update(NmUpdate::WifiAuthRequested(request));
+        assert!(deadline.remaining() > crate::services::nm_secret_agent::AUTH_TIMEOUT);
+    }
+
+    #[test]
+    fn agent_prompts_follow_the_current_attempt() {
+        let service = test_service();
+        let request = prompt_request("psk", "psk-flags");
+
+        // Not activating this network (replaced while queued): never shown.
+        service.apply_update(NmUpdate::WifiAuthRequested(request.clone()));
+        assert!(service.snapshot().wifi.auth_request.is_none());
+
+        service.wifi.connecting_ssid.replace(Some("test".into()));
+        service.apply_update(NmUpdate::WifiAuthRequested(request.clone()));
+        assert_eq!(
+            service.snapshot().wifi.auth_request.as_deref(),
+            Some(&request)
+        );
+
+        // A stale clear from an older request keeps the current prompt.
+        service.apply_update(NmUpdate::WifiAuthCleared { id: 0 });
+        assert!(service.snapshot().wifi.auth_request.is_some());
+        service.apply_update(NmUpdate::WifiAuthCleared { id: request.id });
+        assert!(service.snapshot().wifi.auth_request.is_none());
+
+        // A password for a request the agent no longer holds is not kept.
+        service.snapshot.borrow_mut().wifi.auth_request = Some(Rc::new(request));
+        service.submit_wifi_secret("stale", true);
+        assert!(service.wifi.secret_to_save.borrow().is_none());
     }
 
     #[test]
@@ -1461,7 +1722,7 @@ mod tests {
                     }
                 }).build().unwrap();
                 let mut watcher = std::pin::pin!(wait_activation(client.clone(), server.unique_name().unwrap().to_string(),
-                    "/active".into(), cancel, Duration::from_millis(if case == "timeout" { 20 } else { 2000 })));
+                    "/active".into(), cancel, ActivationDeadline::after(Duration::from_millis(if case == "timeout" { 20 } else { 2000 }))));
                 if case == "cancel_then_state" {
                     // Install the watcher, then hold it until both cancellation and state are queued.
                     std::future::poll_fn(|cx| {
@@ -1957,6 +2218,64 @@ mod tests {
             }
         }
         assert!(new_wifi_settings("test", None, 1, 0x100).is_err());
+    }
+
+    fn prompt_request(secret_key: &str, flags_key: &str) -> WifiAuthRequest {
+        WifiAuthRequest {
+            id: 1,
+            ssid: "test".into(),
+            is_retry: false,
+            offer_save: true,
+            save_ticked: false,
+            connection_path: "/profile".into(),
+            secret_key: secret_key.into(),
+            flags_key: flags_key.into(),
+        }
+    }
+
+    #[test]
+    fn saving_prompt_secret_round_trips_profile_settings() {
+        let (secret_key, flags_key) = ("psk", "psk-flags");
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = glib::MainContext::new().block_on(NmService::save_prompted_secret(
+            |path: &str, _: &str, method: &str, args: Option<&Variant>| {
+                assert_eq!(path, "/profile");
+                calls.borrow_mut().push(method.to_string());
+                std::future::ready(match method {
+                    "GetSettings" => Ok((HashMap::from([
+                        (
+                            "connection".to_string(),
+                            HashMap::from([("id".to_string(), "test".to_variant())]),
+                        ),
+                        (
+                            "802-11-wireless-security".to_string(),
+                            HashMap::from([(flags_key.to_string(), 1u32.to_variant())]),
+                        ),
+                    ]),)
+                        .to_variant()),
+                    "Update2" => {
+                        let args = args.unwrap();
+                        let settings: HashMap<String, HashMap<String, Variant>> =
+                            args.child_value(0).get().unwrap();
+                        let security = &settings["802-11-wireless-security"];
+                        assert_eq!(
+                            security[secret_key].get::<String>().as_deref(),
+                            Some("hunter22")
+                        );
+                        assert_eq!(security[flags_key].get::<u32>(), Some(0));
+                        assert!(settings.contains_key("connection"));
+                        assert_eq!(args.child_value(1).get::<u32>(), Some(0));
+                        Ok(().to_variant())
+                    }
+                    _ => panic!("unexpected {method}"),
+                })
+            },
+            &prompt_request(secret_key, flags_key),
+            "hunter22",
+            &gio::Cancellable::new(),
+        ));
+        assert!(result.is_ok());
+        assert_eq!(*calls.borrow(), ["GetSettings", "Update2"]);
     }
 
     #[test]

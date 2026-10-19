@@ -420,6 +420,7 @@ popover.widget-menu .popover.widget-menu-content {{
 .popover button:focus-visible,
 .popover row:focus-visible,
 .popover switch:focus-visible,
+.popover checkbutton:focus-visible > check,
 .popover entry:focus-within {{
     outline: 2px solid var(--color-accent-primary);
     outline-offset: -2px;
