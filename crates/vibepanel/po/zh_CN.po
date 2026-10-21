@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: vibepanel\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-10-16 15:04+0000\n"
+"POT-Creation-Date: 2026-10-19 17:53+0000\n"
 "PO-Revision-Date: 2026-10-15 14:18+0800\n"
 "Last-Translator: Automatically generated\n"
 "Language-Team: none\n"
@@ -1241,10 +1241,18 @@ msgstr "已关闭"
 msgid "Wi-Fi"
 msgstr "Wi-Fi"
 
+#: ../src/widgets/quick_settings/network_card.rs
+msgid "Save password"
+msgstr "保存密码"
+
 #. Update title
 #: ../src/widgets/quick_settings/network_card.rs
 msgid "Wired Connection"
 msgstr "有线连接"
+
+#: ../src/widgets/quick_settings/network_card.rs
+msgid "Connecting"
+msgstr "正在连接"
 
 #: ../src/widgets/quick_settings/network_card.rs
 msgid "Mobile"
@@ -1273,10 +1281,6 @@ msgstr "分享"
 #: ../src/widgets/quick_settings/network_card.rs
 msgid "Enter password for {ssid}"
 msgstr "输入 {ssid} 的密码"
-
-#: ../src/widgets/quick_settings/network_card.rs
-msgid "Connecting"
-msgstr "正在连接"
 
 #: ../src/widgets/quick_settings/power_card.rs
 msgid "Shut Down"

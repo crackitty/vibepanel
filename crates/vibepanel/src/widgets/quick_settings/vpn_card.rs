@@ -23,9 +23,9 @@ use super::ui_helpers::{
 };
 use super::window::QuickSettingsWindow;
 use crate::services::icons::IconsService;
+use crate::services::nm_secret_agent::VpnAuthRequest;
 use crate::services::surfaces::SurfaceStyleManager;
 use crate::services::vpn::{VpnConnection, VpnService, VpnSnapshot};
-use crate::services::vpn_secret_agent::VpnAuthRequest;
 use crate::styles::{button, color, icon, qs, row, state};
 use crate::widgets::layer_shell_popover::animate_reveal;
 
@@ -576,6 +576,7 @@ fn build_vpn_auth_box(state: &Rc<VpnCardState>) {
     auth_box.set_visible(false);
 
     let auth_label = Label::new(Some(""));
+    auth_label.add_css_class(color::PRIMARY);
     auth_label.set_xalign(0.0);
     auth_label.set_wrap(true);
     auth_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);

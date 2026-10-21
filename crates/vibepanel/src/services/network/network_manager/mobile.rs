@@ -551,7 +551,7 @@ impl NmService {
                             owner.clone(),
                             active.into(),
                             cancel.clone(),
-                            Duration::from_secs(60),
+                            super::wifi::ActivationDeadline::after(Duration::from_secs(60)),
                         )
                     },
                     &status,

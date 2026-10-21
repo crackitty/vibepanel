@@ -21,9 +21,9 @@ use gtk4::glib::{self, Variant};
 use tracing::{debug, error, warn};
 
 use super::callbacks::{CallbackId, Callbacks};
+use super::nm_secret_agent::{NmSecretAgent, VpnAuthRequest};
 use super::sleep_watcher::SleepWatcher;
 use super::state;
-use super::vpn_secret_agent::{VpnAuthRequest, VpnSecretAgent};
 
 /// NetworkManager service name.
 const NM_SERVICE: &str = "org.freedesktop.NetworkManager";
@@ -266,7 +266,7 @@ impl VpnService {
             return;
         }
 
-        VpnSecretAgent::submit_secrets(secrets);
+        NmSecretAgent::submit_secrets(secrets);
 
         // Clear the auth state
         let mut snapshot = self.snapshot.borrow_mut();
@@ -280,7 +280,7 @@ impl VpnService {
     ///
     /// Called from the UI when the user clicks Cancel on the password prompt.
     pub fn cancel_vpn_auth(&self) {
-        VpnSecretAgent::cancel_auth();
+        NmSecretAgent::cancel_auth();
 
         // Clear the auth state
         let mut snapshot = self.snapshot.borrow_mut();
@@ -660,9 +660,6 @@ impl VpnService {
                 .and_then(|p| p.name_owner())
                 .is_some();
             if has_owner {
-                if let Some(conn) = this.connection.borrow().as_ref() {
-                    VpnSecretAgent::re_register_with_agent_manager(conn);
-                }
                 // An old in-flight refresh must not suppress restart recovery.
                 this.refresh_pending.set(false);
                 send_vpn_update(VpnUpdate::RequestRefresh);
@@ -696,7 +693,8 @@ impl VpnService {
                 *this.connection.borrow_mut() = Some(connection.clone());
 
                 // Register NM SecretAgent for VPN password prompts.
-                VpnSecretAgent::register(&connection);
+                NmSecretAgent::enable_vpn();
+                NmSecretAgent::register(&connection);
 
                 // After resume from sleep, signal subscriptions on active connection
                 // paths may be stale. Refresh to re-subscribe to current paths.

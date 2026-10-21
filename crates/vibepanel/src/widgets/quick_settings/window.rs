@@ -731,7 +731,8 @@ impl QuickSettingsWindow {
         network_revealer.set_transition_duration(ConfigManager::global().animation_duration(250));
         let network_state = Rc::clone(&qs.network);
 
-        let network_details = build_wifi_details(&network_state, qs.window.downgrade());
+        let network_details = build_wifi_details(&network_state);
+        network_card::follow_keyboard_focus(&qs.window, &network_details.list_box);
         network_revealer.set_child(Some(&network_details.container));
 
         *qs.network.base.list_box.borrow_mut() = Some(network_details.list_box);
@@ -1271,6 +1272,8 @@ impl QuickSettingsWindow {
 
         // --- Hide auth dialogs ---
         network_card::hide_password_dialog(&self.network);
+        // A still-pending NM agent prompt is shown again on reopen.
+        self.network.nm_auth_request.replace(None);
         vpn_card::hide_vpn_auth_dialog(&self.vpn);
         self.bluetooth.clear_auth_input();
 

@@ -369,6 +369,15 @@ pub mod qs {
     /// Network section header label (`.qs-network-section-label`).
     pub const NETWORK_SECTION_LABEL: &str = "qs-network-section-label";
 
+    /// Inline Wi-Fi password prompt row, aligned with the network rows (`.qs-password-row`).
+    pub const PASSWORD_ROW: &str = "qs-password-row";
+
+    /// Slight indent for secondary lines in the password prompt (`.qs-password-indent`).
+    pub const PASSWORD_INDENT: &str = "qs-password-indent";
+
+    /// Accent-styled checkbox (`.qs-check`).
+    pub const CHECK: &str = "qs-check";
+
     /// Shared network section container (Ethernet, Mobile) in expanded details (`.qs-network-section`).
     pub const NETWORK_SECTION: &str = "qs-network-section";
 

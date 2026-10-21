@@ -4,7 +4,7 @@
 //! so `pkexec`, `systemctl` and other polkit-gated actions prompt in VibePanel
 //! instead of needing a separate agent (polkit-gnome, hyprpolkitagent, ...).
 //!
-//! The D-Bus side is ours (same gio pattern as the VPN secret agent). Password
+//! The D-Bus side is ours (same gio pattern as the NetworkManager secret agent). Password
 //! verification goes through libpolkit-agent-1's `PolkitAgentSession`, loaded
 //! at runtime, which spawns the setuid helper or uses polkit's socket-activated
 //! helper, whichever the installed polkit provides.
