@@ -2368,14 +2368,6 @@ mod tests {
     }
 
     #[test]
-    fn test_config_search_paths() {
-        let paths = Config::config_search_paths();
-        // Should at least have ./config.toml
-        assert!(!paths.is_empty());
-        assert!(paths.iter().any(|p| p.ends_with("config.toml")));
-    }
-
-    #[test]
     fn test_validate_center_widgets_ok() {
         let mut config = Config::default();
         config

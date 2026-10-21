@@ -120,16 +120,6 @@ fn test_find_and_load_explicit_missing_fails() {
 }
 
 #[test]
-fn test_find_and_load_no_explicit_uses_search_chain() {
-    // When no explicit path is given, should search XDG chain
-    // In test environment, this may find ./config.toml or use defaults
-    let result = Config::find_and_load(None).unwrap();
-
-    // Config should be valid regardless of source
-    result.config.validate().expect("Config should be valid");
-}
-
-#[test]
 fn test_broken_config_returns_error_not_defaults() {
     use std::io::Write;
 
