@@ -98,6 +98,7 @@ stop
 sunny
 table
 thunderstorm
+touchpad_mouse
 usb
 view_array
 view_module
